@@ -8,7 +8,7 @@ from app import init_db, collect_all_categories
 
 def main():
     init_db()
-    stats = collect_all_categories()
+    stats = collect_all_categories(generate_summaries=True)
 
     print("=== GPA NEWS COLLECTOR COMPLETE ===")
     print(f"Feeds checked      : {stats['feeds_checked']}")

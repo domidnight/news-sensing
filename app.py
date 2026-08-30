@@ -4,9 +4,11 @@ import hmac
 import hashlib
 import urllib.parse
 import email.utils
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 
 import feedparser
+import requests
 import streamlit as st
 from bs4 import BeautifulSoup
 from google import genai
@@ -38,7 +40,10 @@ KST = timezone(timedelta(hours=9))
 SEARCH_LOOKBACK_HOURS = int(os.environ.get("SEARCH_LOOKBACK_HOURS", "48"))
 
 # Gemini 모델명은 Railway 변수에서 바꿀 수 있음
-GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.7-flash")
+GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
+
+RSS_TIMEOUT_SECONDS = int(os.environ.get("RSS_TIMEOUT_SECONDS", "10"))
+RSS_MAX_WORKERS = int(os.environ.get("RSS_MAX_WORKERS", "10"))
 
 # 최초 1회만 DB에 들어가는 기본값.
 # 이후에는 웹사이트의 관리자 설정 화면에서 수정/저장하면 DB 값이 계속 유지됩니다.
@@ -519,11 +524,28 @@ def upsert_article(
     return article_id, is_new, needs_summary
 
 
-def collect_all_categories() -> dict:
+def _fetch_feed_job(job: dict) -> dict:
+    """Google News RSS 요청 1건을 timeout과 함께 가져옵니다."""
+    try:
+        response = requests.get(
+            job["rss_url"],
+            timeout=RSS_TIMEOUT_SECONDS,
+            headers={"User-Agent": "Mozilla/5.0 GPA-News-Sensing/2.0"},
+        )
+        response.raise_for_status()
+        feed = feedparser.parse(response.content)
+        return {**job, "entries": list(getattr(feed, "entries", [])), "error": None}
+    except Exception as exc:
+        return {**job, "entries": [], "error": str(exc)}
+
+
+def collect_all_categories(generate_summaries: bool = True) -> dict:
     """
-    설정된 5개 카테고리와 언론사를 모두 검색합니다.
-    이 함수는 app.py의 수동 새로고침에서도 쓰고,
-    collector.py의 30분 자동 실행에서도 그대로 씁니다.
+    generate_summaries=False:
+        웹사이트 수동 버튼용. RSS만 빠르게 병렬 수집하고 요약은 기다리지 않습니다.
+
+    generate_summaries=True:
+        자동 collector용. RSS 수집 후 요약이 없는 기사까지 Gemini로 처리합니다.
     """
     keyword_map, domains = get_settings()
 
@@ -536,6 +558,7 @@ def collect_all_categories() -> dict:
     }
 
     chunk_size = 4
+    jobs = []
 
     for category_name in CATEGORY_NAMES:
         category_keywords = keyword_map.get(category_name, [])
@@ -547,92 +570,106 @@ def collect_all_categories() -> dict:
             for i in range(0, len(category_keywords), chunk_size)
         ]
 
-        # 같은 카테고리에서 동일 기사가 여러 chunk로 중복 처리되지 않게 함
-        seen_links_for_category = set()
-
         for domain in domains:
             for chunk in chunks:
                 query_parts = [f'"{kw}"' for kw in chunk]
                 kw_query = " OR ".join(query_parts)
-
                 full_query = (
                     f"({kw_query}) site:{domain} "
                     f"when:{SEARCH_LOOKBACK_HOURS}h"
                 )
-
                 encoded_query = urllib.parse.quote(full_query)
                 rss_url = (
                     "https://news.google.com/rss/search"
                     f"?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
                 )
+                jobs.append(
+                    {
+                        "category_name": category_name,
+                        "category_keywords": category_keywords,
+                        "domain": domain,
+                        "rss_url": rss_url,
+                    }
+                )
 
-                try:
-                    feed = feedparser.parse(rss_url)
-                    stats["feeds_checked"] += 1
-                except Exception as exc:
-                    print(f"[Feed error] {domain}: {exc}")
+    feed_results = []
+    if jobs:
+        workers = max(1, min(RSS_MAX_WORKERS, len(jobs)))
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = [executor.submit(_fetch_feed_job, job) for job in jobs]
+            for future in as_completed(futures):
+                result = future.result()
+                feed_results.append(result)
+                stats["feeds_checked"] += 1
+                if result["error"]:
+                    print(f"[Feed error] {result['domain']}: {result['error']}")
                     stats["errors"] += 1
-                    continue
 
-                for entry in getattr(feed, "entries", []):
-                    title = str(entry.get("title", "") or "")
-                    description_raw = str(entry.get("description", "") or "")
-                    link = str(entry.get("link", "") or "")
+    seen_links_by_category = {
+        category_name: set() for category_name in CATEGORY_NAMES
+    }
+    summary_queue = {}
 
-                    if not link or link in seen_links_for_category:
-                        continue
+    for result in feed_results:
+        category_name = result["category_name"]
+        category_keywords = result["category_keywords"]
 
-                    text_to_search = f"{title} {description_raw}"
+        for entry in result["entries"]:
+            title = str(entry.get("title", "") or "")
+            description_raw = str(entry.get("description", "") or "")
+            link = str(entry.get("link", "") or "")
 
-                    # 중요:
-                    # 각 키워드를 "하나의 정확 구문"으로 다시 검사
-                    matched_keywords = [
-                        kw for kw in category_keywords
-                        if exact_phrase_match(kw, text_to_search)
-                    ]
+            if not link or link in seen_links_by_category[category_name]:
+                continue
 
-                    if not matched_keywords:
-                        continue
+            text_to_search = f"{title} {description_raw}"
+            matched_keywords = [
+                kw for kw in category_keywords
+                if exact_phrase_match(kw, text_to_search)
+            ]
 
-                    seen_links_for_category.add(link)
-                    stats["matched_articles"] += 1
+            if not matched_keywords:
+                continue
 
-                    source = get_feed_source(entry)
-                    published_at = parse_published(
-                        str(entry.get("published", "") or "")
-                    )
+            seen_links_by_category[category_name].add(link)
+            stats["matched_articles"] += 1
 
-                    clean_description = BeautifulSoup(
-                        description_raw, "html.parser"
-                    ).get_text(" ", strip=True)
+            source = get_feed_source(entry)
+            published_at = parse_published(str(entry.get("published", "") or ""))
+            clean_description = BeautifulSoup(
+                description_raw, "html.parser"
+            ).get_text(" ", strip=True)
 
-                    try:
-                        article_id, is_new, needs_summary = upsert_article(
-                            category_name=category_name,
-                            title=title,
-                            link=link,
-                            source=source,
-                            published_at=published_at,
-                            description=clean_description,
-                            matched_keywords=matched_keywords,
-                        )
+            try:
+                article_id, is_new, needs_summary = upsert_article(
+                    category_name=category_name,
+                    title=title,
+                    link=link,
+                    source=source,
+                    published_at=published_at,
+                    description=clean_description,
+                    matched_keywords=matched_keywords,
+                )
 
-                        if is_new:
-                            stats["new_articles"] += 1
+                if is_new:
+                    stats["new_articles"] += 1
 
-                        # 신규 기사 또는 과거에 요약이 실패했던 기사라면 다시 요약 시도
-                        if article_id and needs_summary:
-                            summary = summarize_article(
-                                title=title,
-                                description=clean_description,
-                            )
-                            if summary:
-                                update_article_summary(article_id, summary)
-                                stats["summaries_created"] += 1
+                if article_id and needs_summary and generate_summaries:
+                    summary_queue[article_id] = (title, clean_description)
 
-                    except Exception as exc:
-                        print(f"[Article save error] {exc}")
-                        stats["errors"] += 1
+            except Exception as exc:
+                print(f"[Article save error] {exc}")
+                stats["errors"] += 1
+
+    if generate_summaries:
+        for article_id, (title, clean_description) in summary_queue.items():
+            summary = summarize_article(
+                title=title,
+                description=clean_description,
+            )
+            if summary:
+                update_article_summary(article_id, summary)
+                stats["summaries_created"] += 1
 
     return stats
 
@@ -832,8 +869,9 @@ def render_article_card(article: dict, category_name: str):
         st.markdown(article["summary"])
     else:
         st.info(
-            "3줄 요약이 아직 없습니다. "
-            "GEMINI_API_KEY를 확인한 뒤 아래 버튼으로 생성할 수 있습니다."
+            "🤖 아직 3줄 요약이 생성되지 않은 기사입니다. "
+            "아래 버튼을 누르면 지금 바로 생성할 수 있습니다. "
+            "자동 수집기가 연결되면 요약도 자동으로 채워집니다."
         )
         if st.button(
             "🤖 이 기사 3줄 요약 생성",
@@ -878,18 +916,18 @@ def main():
     with top1:
         if st.button("🔄 지금 새 뉴스 수집", use_container_width=True):
             with st.spinner("등록된 키워드와 언론사를 검색하고 있습니다..."):
-                stats = collect_all_categories()
+                stats = collect_all_categories(generate_summaries=False)
 
             st.success(
-                f"수집 완료: 신규 기사 {stats['new_articles']}개 / "
-                f"요약 생성 {stats['summaries_created']}개"
+                f"빠른 수집 완료: 신규 기사 {stats['new_articles']}개 / "
+                f"RSS 오류 {stats['errors']}건"
             )
             st.rerun()
 
     with top2:
         st.caption(
             f"현재 DB 저장 기사: {count_articles()}개 · "
-            f"자동 수집은 collector.py를 Railway Cron으로 30분마다 실행합니다."
+            f"자동 수집은 news-collector를 연결하면 30분마다 실행됩니다."
         )
 
     keyword_map, _ = get_settings()
