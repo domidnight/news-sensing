@@ -674,6 +674,51 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
     return stats
 
 
+def summarize_pending_articles(limit: int = 10) -> dict:
+    """
+    DB에 이미 저장되어 있지만 summary가 비어 있는 과거 기사를
+    오래된 순서대로 최대 limit개 자동 보충합니다.
+    """
+    stats = {
+        "checked": 0,
+        "summarized": 0,
+        "failed": 0,
+    }
+
+    with SessionLocal() as session:
+        pending = session.scalars(
+            select(Article)
+            .where(Article.summary.is_(None))
+            .order_by(Article.detected_at.asc())
+            .limit(limit)
+        ).all()
+
+        # 세션 밖에서도 안전하게 쓸 수 있도록 필요한 값만 복사
+        items = [
+            {
+                "id": article.id,
+                "title": article.title,
+                "description": article.description,
+            }
+            for article in pending
+        ]
+
+    for item in items:
+        stats["checked"] += 1
+        summary = summarize_article(
+            title=item["title"],
+            description=item["description"],
+        )
+
+        if summary:
+            update_article_summary(item["id"], summary)
+            stats["summarized"] += 1
+        else:
+            stats["failed"] += 1
+
+    return stats
+
+
 # =========================================================
 # 6. 화면용 조회
 # =========================================================
@@ -871,7 +916,7 @@ def render_article_card(article: dict, category_name: str):
         st.info(
             "🤖 아직 3줄 요약이 생성되지 않은 기사입니다. "
             "아래 버튼을 누르면 지금 바로 생성할 수 있습니다. "
-            "자동 수집기가 연결되면 요약도 자동으로 채워집니다."
+            "자동 수집기가 연결되면 새 기사뿐 아니라 기존 미요약 기사도 자동으로 채워집니다."
         )
         if st.button(
             "🤖 이 기사 3줄 요약 생성",
