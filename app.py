@@ -2,6 +2,7 @@ import os
 import re
 import hmac
 import hashlib
+import json
 import urllib.parse
 import email.utils
 from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -34,7 +35,21 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 # 0. 기본 설정
 # =========================================================
 
-CATEGORY_NAMES = ["AI", "국무부", "국방부", "텍사스", "관세"]
+NEWS_CATEGORY_NAMES = ["AI", "국무부", "국방부", "텍사스", "관세"]
+SOCIAL_CATEGORY_NAMES = ["소셜 (Helberg)", "소셜 (Bessent)"]
+CATEGORY_NAMES = NEWS_CATEGORY_NAMES + SOCIAL_CATEGORY_NAMES
+
+# 무료 공개 X 임베드 타임라인 기반 센싱 대상
+# Helberg는 국무부 공식 직책 계정 + 개인 공개 계정을 함께 확인합니다.
+SOCIAL_ACCOUNTS = {
+    "소셜 (Helberg)": [
+        {"handle": "UnderSecE", "label": "Jacob S. Helberg · 국무부 공식"},
+        {"handle": "jacobhelberg", "label": "Jacob Helberg · 개인 공개"},
+    ],
+    "소셜 (Bessent)": [
+        {"handle": "SecScottBessent", "label": "Scott Bessent · 재무장관 공식"},
+    ],
+}
 KST = timezone(timedelta(hours=9))
 
 # Google News 검색 시 최근 몇 시간을 볼지 설정
@@ -220,31 +235,54 @@ class SummaryUsage(Base):
 
 
 def init_db():
-    """DB 테이블을 만들고, 최초 실행 시에만 기본 설정을 입력합니다."""
+    """
+    DB 테이블을 만들고 필요한 기본 카테고리를 보장합니다.
+    기존 운영 DB가 있어도 새 소셜 카테고리는 자동으로 추가됩니다.
+    """
     Base.metadata.create_all(engine)
 
     with SessionLocal() as session:
-        category_count = session.scalar(select(func.count(Category.id))) or 0
+        category_by_name = {
+            c.name: c
+            for c in session.scalars(select(Category)).all()
+        }
 
-        # DB가 완전히 처음 만들어졌을 때만 기본값 입력
-        if category_count == 0:
-            category_objects = {}
-
-            for idx, category_name in enumerate(CATEGORY_NAMES):
+        # 기존 DB에도 새 카테고리를 자동 추가
+        for idx, category_name in enumerate(CATEGORY_NAMES):
+            if category_name not in category_by_name:
                 obj = Category(name=category_name, sort_order=idx)
                 session.add(obj)
                 session.flush()
-                category_objects[category_name] = obj
+                category_by_name[category_name] = obj
+            else:
+                category_by_name[category_name].sort_order = idx
 
+        # 뉴스 카테고리 키워드는 해당 카테고리에 키워드가 하나도 없을 때만 기본값 입력
+        for category_name in NEWS_CATEGORY_NAMES:
+            category = category_by_name[category_name]
+            kw_count = session.scalar(
+                select(func.count(Keyword.id))
+                .where(Keyword.category_id == category.id)
+            ) or 0
+
+            if kw_count == 0:
                 for kw in DEFAULT_KEYWORDS.get(category_name, []):
                     session.add(
-                        Keyword(category_id=obj.id, keyword=normalize_keyword(kw))
+                        Keyword(
+                            category_id=category.id,
+                            keyword=normalize_keyword(kw),
+                        )
                     )
 
+        # 언론사 설정이 완전히 비어 있을 때만 기본값 입력
+        source_count = session.scalar(select(func.count(Source.id))) or 0
+        if source_count == 0:
             for domain in DEFAULT_DOMAINS:
-                session.add(Source(domain=normalize_domain(domain), enabled=True))
+                session.add(
+                    Source(domain=normalize_domain(domain), enabled=True)
+                )
 
-            session.commit()
+        session.commit()
 
 
 # =========================================================
@@ -364,7 +402,7 @@ def save_settings(keyword_map: dict[str, list[str]], domains: list[str]):
         session.execute(delete(Keyword))
         session.execute(delete(Source))
 
-        for category_name in CATEGORY_NAMES:
+        for category_name in NEWS_CATEGORY_NAMES:
             category = category_by_name[category_name]
             seen_kw = set()
 
@@ -450,7 +488,7 @@ def summarize_article(title: str, description: str) -> str | None:
     clean_description = clean_description[:2500]
 
     prompt = f"""
-아래 뉴스의 제목과 Google News RSS에 포함된 기사 설명을 바탕으로,
+아래 뉴스 기사 또는 공개 소셜 게시물의 제목/원문을 바탕으로,
 글로벌 대외협력(GPA) 담당자가 빠르게 핵심을 파악할 수 있도록 한국어로 요약해 주세요.
 
 규칙:
@@ -462,7 +500,7 @@ def summarize_article(title: str, description: str) -> str | None:
 제목:
 {title}
 
-기사 설명:
+원문/설명:
 {clean_description}
 """.strip()
 
@@ -638,7 +676,7 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
     chunk_size = 4
     jobs = []
 
-    for category_name in CATEGORY_NAMES:
+    for category_name in NEWS_CATEGORY_NAMES:
         category_keywords = keyword_map.get(category_name, [])
         if not category_keywords:
             continue
@@ -684,7 +722,7 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
                     stats["errors"] += 1
 
     seen_links_by_category = {
-        category_name: set() for category_name in CATEGORY_NAMES
+        category_name: set() for category_name in NEWS_CATEGORY_NAMES
     }
     summary_queue = {}
 
@@ -764,9 +802,174 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
     return stats
 
 
+def _parse_x_created_at(raw_value: str) -> datetime | None:
+    """X syndication의 created_at 문자열을 UTC datetime으로 변환."""
+    raw_value = str(raw_value or "").strip()
+    if not raw_value:
+        return None
+
+    try:
+        dt = datetime.strptime(
+            raw_value,
+            "%a %b %d %H:%M:%S %z %Y",
+        )
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    try:
+        dt = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        return None
+
+
+def _fetch_x_profile_timeline(handle: str) -> list[dict]:
+    """
+    X의 공개 임베드 타임라인(syndication)에서 공개 프로필 게시물을 가져옵니다.
+    API Key가 필요 없는 무료 경로지만 X가 내부 구조를 바꾸면 동작이 깨질 수 있습니다.
+    """
+    url = (
+        "https://syndication.twitter.com/srv/"
+        f"timeline-profile/screen-name/{handle}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=RSS_TIMEOUT_SECONDS,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if not script:
+        raise ValueError("X 공개 타임라인 데이터(__NEXT_DATA__)를 찾지 못했습니다.")
+
+    raw_json = script.string or script.get_text()
+    data = json.loads(raw_json)
+
+    page_props = data.get("props", {}).get("pageProps", {})
+    entries = page_props.get("timeline", {}).get("entries", [])
+
+    posts = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        content = entry.get("content") or {}
+        tweet = content.get("tweet") if isinstance(content, dict) else None
+        if not isinstance(tweet, dict):
+            continue
+
+        tweet_id = str(tweet.get("id_str") or tweet.get("id") or "").strip()
+        full_text = str(
+            tweet.get("full_text")
+            or tweet.get("text")
+            or ""
+        ).strip()
+
+        if not tweet_id or not full_text:
+            continue
+
+        user = tweet.get("user") or {}
+        author_handle = str(
+            user.get("screen_name") or handle
+        ).strip()
+        author_name = str(
+            user.get("name") or author_handle
+        ).strip()
+
+        permalink = str(tweet.get("permalink") or "").strip()
+        if permalink.startswith("/"):
+            permalink = "https://x.com" + permalink
+        elif not permalink.startswith("http"):
+            permalink = f"https://x.com/{author_handle}/status/{tweet_id}"
+
+        posts.append(
+            {
+                "id": tweet_id,
+                "text": full_text,
+                "link": permalink,
+                "published_at": _parse_x_created_at(
+                    tweet.get("created_at", "")
+                ),
+                "author_handle": author_handle,
+                "author_name": author_name,
+            }
+        )
+
+    return posts
+
+
+def collect_social_posts() -> dict:
+    """
+    Helberg/Bessent 공개 X 계정을 무료 best-effort 방식으로 센싱합니다.
+    새 게시물은 기존 articles/article_matches 테이블에 함께 저장됩니다.
+    """
+    stats = {
+        "profiles_checked": 0,
+        "matched_posts": 0,
+        "new_posts": 0,
+        "errors": 0,
+    }
+
+    for category_name, accounts in SOCIAL_ACCOUNTS.items():
+        for account in accounts:
+            handle = account["handle"]
+            label = account["label"]
+
+            try:
+                posts = _fetch_x_profile_timeline(handle)
+                stats["profiles_checked"] += 1
+            except Exception as exc:
+                print(f"[Social feed error] @{handle}: {exc}")
+                stats["errors"] += 1
+                continue
+
+            for post in posts:
+                stats["matched_posts"] += 1
+
+                # 제목은 목록 가독성을 위해 짧게, 원문은 description에 전체 저장
+                one_line = re.sub(r"\s+", " ", post["text"]).strip()
+                title = (
+                    one_line[:150] + "…"
+                    if len(one_line) > 150
+                    else one_line
+                )
+
+                try:
+                    _, is_new, _ = upsert_article(
+                        category_name=category_name,
+                        title=title,
+                        link=post["link"],
+                        source=f"X · @{handle}",
+                        published_at=post["published_at"],
+                        description=post["text"],
+                        matched_keywords=[f"@{handle}"],
+                    )
+
+                    if is_new:
+                        stats["new_posts"] += 1
+
+                except Exception as exc:
+                    print(f"[Social save error] @{handle}: {exc}")
+                    stats["errors"] += 1
+
+    return stats
+
+
 def summarize_pending_articles(limit: int = 10) -> dict:
     """
-    기존 미요약 기사를 자동 요약하되, 신규 기사 자동요약과 합쳐
+    가장 최근의 미요약 콘텐츠를 우선 자동 요약하되,
     하루 AUTO_SUMMARY_DAILY_LIMIT(기본 10회)을 절대 넘지 않습니다.
     """
     stats = {
@@ -788,7 +991,7 @@ def summarize_pending_articles(limit: int = 10) -> dict:
         pending = session.scalars(
             select(Article)
             .where(Article.summary.is_(None))
-            .order_by(Article.detected_at.asc())
+            .order_by(Article.detected_at.desc())
             .limit(allowed)
         ).all()
 
@@ -954,7 +1157,7 @@ def render_sidebar_settings():
         with st.sidebar.form("settings_form"):
             keyword_inputs = {}
 
-            for category_name in CATEGORY_NAMES:
+            for category_name in NEWS_CATEGORY_NAMES:
                 with st.expander(f"🔎 {category_name} 키워드", expanded=False):
                     keyword_inputs[category_name] = st.text_area(
                         f"{category_name} 키워드",
@@ -979,7 +1182,7 @@ def render_sidebar_settings():
             if submitted:
                 new_keyword_map = {
                     name: parse_multiline_values(keyword_inputs[name])
-                    for name in CATEGORY_NAMES
+                    for name in NEWS_CATEGORY_NAMES
                 }
                 new_domains = parse_multiline_values(domains_input)
 
@@ -1056,6 +1259,71 @@ def render_article_card(article: dict, category_name: str):
     st.divider()
 
 
+def render_social_card(article: dict, category_name: str):
+    """소셜 탭 전용 카드."""
+    source = article["source"] or "X"
+    tags = article["tags"]
+
+    st.markdown(f"### 🗣️ {source}")
+
+    if tags:
+        st.markdown(
+            " ".join(f"`{tag}`" for tag in tags)
+        )
+
+    st.markdown(article["description"] or article["title"])
+
+    col1, col2 = st.columns(2)
+    with col1:
+        st.caption(
+            f"🕒 게시: {format_kst(article['published_at'])}"
+        )
+    with col2:
+        st.caption(
+            f"📡 최초 감지: {format_kst(article['detected_at'])}"
+        )
+
+    if article["summary"]:
+        st.markdown("**🤖 3줄 요약**")
+        st.markdown(article["summary"])
+    else:
+        st.info(
+            "🤖 아직 요약이 생성되지 않은 공개 소셜 게시물입니다. "
+            "자동 요약은 뉴스와 소셜을 합쳐 하루 최대 10개이며, "
+            "필요한 게시물은 수동 요약 버튼으로 확인할 수 있습니다."
+        )
+
+        if st.button(
+            "🤖 이 게시물 3줄 요약 생성",
+            key=f"social_summary_{category_name}_{article['id']}",
+        ):
+            if remaining_summary_quota("manual") <= 0:
+                st.warning(
+                    "오늘 이 사이트의 수동 요약 10회를 모두 사용했습니다."
+                )
+            else:
+                with st.spinner("요약 중..."):
+                    summary = summarize_article(
+                        article["title"],
+                        article["description"],
+                    )
+                    if summary:
+                        update_article_summary(article["id"], summary)
+                        record_summary_usage("manual", article["id"])
+                        st.rerun()
+                    elif _LAST_SUMMARY_ERROR == "quota":
+                        st.error(
+                            "Gemini 프로젝트의 실제 무료 일일 한도가 소진되었습니다."
+                        )
+                    else:
+                        st.error(
+                            "요약 생성에 실패했습니다. 잠시 후 다시 시도해주세요."
+                        )
+
+    st.link_button("🔗 X 원문 보기", article["link"])
+    st.divider()
+
+
 def main():
     st.set_page_config(
         page_title="GPA 뉴스 센싱 대시보드 V2",
@@ -1067,8 +1335,8 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V2")
     st.caption(
-        "키워드·언론사 영구 저장 / 5개 카테고리 / 정확 구문 검색 / "
-        "기사 DB 저장 / 최초 감지 시각 / Gemini 3줄 요약"
+        "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 2개 탭 / 정확 구문 검색 / "
+        "기사·공개 소셜 DB 저장 / 최초 감지 시각 / Gemini 3줄 요약"
     )
 
     render_sidebar_settings()
@@ -1076,13 +1344,15 @@ def main():
     top1, top2 = st.columns([1, 3])
 
     with top1:
-        if st.button("🔄 지금 새 뉴스 수집", use_container_width=True):
-            with st.spinner("등록된 키워드와 언론사를 검색하고 있습니다..."):
+        if st.button("🔄 지금 새 뉴스·소셜 수집", use_container_width=True):
+            with st.spinner("뉴스와 공개 소셜 계정을 빠르게 확인하고 있습니다..."):
                 stats = collect_all_categories(generate_summaries=False)
+                social_stats = collect_social_posts()
 
             st.success(
                 f"빠른 수집 완료: 신규 기사 {stats['new_articles']}개 / "
-                f"RSS 오류 {stats['errors']}건"
+                f"신규 소셜 {social_stats['new_posts']}개 / "
+                f"오류 {stats['errors'] + social_stats['errors']}건"
             )
             st.rerun()
 
@@ -1107,19 +1377,35 @@ def main():
 
     for tab, category_name in zip(tabs, CATEGORY_NAMES):
         with tab:
-            current_keywords = keyword_map.get(category_name, [])
+            is_social = category_name in SOCIAL_CATEGORY_NAMES
 
-            if current_keywords:
+            if is_social:
+                account_labels = [
+                    f"{a['label']} (@{a['handle']})"
+                    for a in SOCIAL_ACCOUNTS.get(category_name, [])
+                ]
                 st.caption(
-                    "현재 키워드: "
-                    + " · ".join(f'"{kw}"' for kw in current_keywords)
+                    "무료 공개 X 센싱 대상: "
+                    + " · ".join(account_labels)
+                )
+                st.caption(
+                    "※ X의 공개 임베드 타임라인을 이용한 무료 best-effort 방식이라 "
+                    "X가 구조를 변경하면 일시적으로 수집이 중단될 수 있습니다."
                 )
             else:
-                st.warning(
-                    f"{category_name} 탭에 등록된 키워드가 없습니다. "
-                    "관리자 설정에서 키워드를 추가해주세요."
-                )
-                continue
+                current_keywords = keyword_map.get(category_name, [])
+
+                if current_keywords:
+                    st.caption(
+                        "현재 키워드: "
+                        + " · ".join(f'"{kw}"' for kw in current_keywords)
+                    )
+                else:
+                    st.warning(
+                        f"{category_name} 탭에 등록된 키워드가 없습니다. "
+                        "관리자 설정에서 키워드를 추가해주세요."
+                    )
+                    continue
 
             selected_period = st.selectbox(
                 "기간 (최초 감지 시각 기준)",
@@ -1135,16 +1421,27 @@ def main():
             )
 
             if not articles:
-                st.info(
-                    "해당 기간에 저장된 기사가 없습니다. "
-                    "상단의 '지금 새 뉴스 수집'을 눌러 먼저 검색해보세요."
-                )
+                if is_social:
+                    st.info(
+                        "아직 저장된 공개 소셜 게시물이 없습니다. "
+                        "상단의 '지금 새 뉴스·소셜 수집'을 누르거나 "
+                        "30분 자동 수집을 기다려주세요."
+                    )
+                else:
+                    st.info(
+                        "해당 기간에 저장된 기사가 없습니다. "
+                        "상단의 '지금 새 뉴스·소셜 수집'을 눌러 먼저 검색해보세요."
+                    )
                 continue
 
-            st.success(f"조건에 맞는 기사 {len(articles)}개")
+            label = "게시물" if is_social else "기사"
+            st.success(f"조건에 맞는 {label} {len(articles)}개")
 
             for article in articles:
-                render_article_card(article, category_name)
+                if is_social:
+                    render_social_card(article, category_name)
+                else:
+                    render_article_card(article, category_name)
 
 
 if __name__ == "__main__":
