@@ -330,27 +330,305 @@ def parse_multiline_values(text: str) -> list[str]:
     return values
 
 
-def exact_phrase_match(keyword: str, text: str) -> bool:
-    """
-    핵심 요구사항:
-    사용자가 'A B'를 등록했으면 A만, B만, A ... B는 잡지 않고
-    'A B'라는 연속 구문만 잡습니다.
+# 검색어 마지막 단어의 자연스러운 단수/복수 처리를 위한 최소 규칙
+# 뉴스/정책 분야에서 자주 쓰는 불규칙형도 포함합니다.
+IRREGULAR_SINGULAR_TO_PLURAL = {
+    "analysis": "analyses",
+    "basis": "bases",
+    "crisis": "crises",
+    "criterion": "criteria",
+    "index": "indices",
+    "matrix": "matrices",
+    "person": "people",
+    "child": "children",
+    "man": "men",
+    "woman": "women",
+}
+IRREGULAR_PLURAL_TO_SINGULAR = {
+    plural: singular
+    for singular, plural in IRREGULAR_SINGULAR_TO_PLURAL.items()
+}
 
-    단, A와 B 사이의 공백 개수 차이는 허용합니다.
+# 자동 복수형을 만들지 않는 대표적인 불가산/고유 성격 단어
+UNCOUNTABLE_WORDS = {
+    "ai",
+    "data",
+    "information",
+    "intelligence",
+    "research",
+    "news",
+    "equipment",
+    "software",
+    "hardware",
+    "media",
+}
+
+
+def _match_word_case(source: str, target_lower: str) -> str:
+    """원래 단어의 대소문자 느낌을 최대한 유지합니다."""
+    if source.isupper():
+        return target_lower.upper()
+    if source[:1].isupper():
+        return target_lower[:1].upper() + target_lower[1:]
+    return target_lower
+
+
+def _pluralize_word(word: str) -> str | None:
+    """
+    단어 하나의 자연스러운 영어 복수형을 만듭니다.
+    예: Policy -> Policies, Center -> Centers, Company -> Companies
+    """
+    word = (word or "").strip()
+    if not word:
+        return None
+
+    lower = word.lower()
+
+    # AI, OpenAI 같은 약어/고유표현과 대표적인 불가산명사는 자동 변화하지 않음
+    if lower in UNCOUNTABLE_WORDS:
+        return None
+    if len(word) <= 2 and word.isupper():
+        return None
+
+    if lower in IRREGULAR_SINGULAR_TO_PLURAL:
+        return _match_word_case(
+            word,
+            IRREGULAR_SINGULAR_TO_PLURAL[lower],
+        )
+
+    # 이미 대표적인 복수형처럼 보이면 새 복수형을 만들지 않음
+    if lower in IRREGULAR_PLURAL_TO_SINGULAR:
+        return None
+
+    if re.search(r"[^aeiou]y$", lower):
+        plural = lower[:-1] + "ies"
+    elif re.search(r"(s|x|z|ch|sh)$", lower):
+        plural = lower + "es"
+    else:
+        plural = lower + "s"
+
+    return _match_word_case(word, plural)
+
+
+def _singularize_word(word: str) -> str | None:
+    """
+    사용자가 복수형을 입력한 경우에도 대응되는 단수형을 함께 허용합니다.
+    예: Policies -> Policy, Centers -> Center
+    """
+    word = (word or "").strip()
+    if not word:
+        return None
+
+    lower = word.lower()
+
+    if lower in UNCOUNTABLE_WORDS:
+        return None
+
+    if lower in IRREGULAR_PLURAL_TO_SINGULAR:
+        return _match_word_case(
+            word,
+            IRREGULAR_PLURAL_TO_SINGULAR[lower],
+        )
+
+    singular = None
+
+    if re.search(r"[^aeiou]ies$", lower) and len(lower) > 3:
+        singular = lower[:-3] + "y"
+    elif re.search(r"(ches|shes|xes|zes|sses)$", lower):
+        singular = lower[:-2]
+    elif lower.endswith("s") and not lower.endswith(
+        ("ss", "us", "is")
+    ):
+        singular = lower[:-1]
+
+    if not singular or singular == lower:
+        return None
+
+    return _match_word_case(word, singular)
+
+
+def _strip_outer_quotes(value: str) -> str:
+    """검색어 구성요소의 바깥 큰따옴표/작은따옴표를 제거합니다."""
+    value = normalize_keyword(value)
+
+    if len(value) >= 2:
+        if (
+            (value[0] == '"' and value[-1] == '"')
+            or (value[0] == "'" and value[-1] == "'")
+        ):
+            value = value[1:-1].strip()
+
+    return normalize_keyword(value)
+
+
+def parse_keyword_expression(keyword: str) -> list[str]:
+    """
+    검색 문법:
+    - AI Policy
+      -> 하나의 phrase
+    - "AI" AND "Data Center"
+      -> AI와 Data Center(s)가 기사 안에 모두 있어야 함
+
+    AND / And / and 모두 허용합니다.
     """
     keyword = normalize_keyword(keyword)
     if not keyword:
+        return []
+
+    parts = re.split(r"\s+AND\s+", keyword, flags=re.IGNORECASE)
+    parts = [_strip_outer_quotes(part) for part in parts]
+    return [part for part in parts if part]
+
+
+def phrase_variants(phrase: str) -> list[str]:
+    """
+    phrase 전체는 그대로 유지하되 마지막 단어만 자연스러운
+    단수/복수형을 자동 허용합니다.
+
+    예:
+    AI Policy -> AI Policy / AI Policies
+    Data Center -> Data Center / Data Centers
+    Data Centers -> Data Centers / Data Center
+    """
+    phrase = _strip_outer_quotes(phrase)
+    if not phrase:
+        return []
+
+    words = phrase.split()
+    if not words:
+        return []
+
+    variants = [phrase]
+    last_word = words[-1]
+
+    alternate_last = _singularize_word(last_word)
+    if alternate_last is None:
+        alternate_last = _pluralize_word(last_word)
+
+    if alternate_last and alternate_last.lower() != last_word.lower():
+        alternate_phrase = " ".join(words[:-1] + [alternate_last])
+        variants.append(alternate_phrase)
+
+    # 순서 유지 + 중복 제거
+    result = []
+    seen = set()
+
+    for variant in variants:
+        key = variant.lower()
+        if key not in seen:
+            seen.add(key)
+            result.append(variant)
+
+    return result
+
+
+def _single_phrase_match(phrase: str, clean_text: str) -> bool:
+    """
+    phrase의 단어 순서/연속성을 유지해서 검색합니다.
+    마지막 단어는 자연스러운 단수/복수형을 자동 허용합니다.
+    """
+    for variant in phrase_variants(phrase):
+        parts = variant.split(" ")
+        pattern_body = r"\s+".join(
+            re.escape(part) for part in parts
+        )
+        pattern = rf"(?<!\w){pattern_body}(?!\w)"
+
+        if re.search(
+            pattern,
+            clean_text,
+            flags=re.IGNORECASE,
+        ):
+            return True
+
+    return False
+
+
+def exact_phrase_match(keyword: str, text: str) -> bool:
+    """
+    실제 기사 후처리 검색 규칙.
+
+    1) AND 없는 경우:
+       전체 입력값을 하나의 연속 phrase로 검색.
+       마지막 단어의 자연스러운 단수/복수는 자동 허용.
+
+       AI Policy
+       -> AI Policy / AI Policies
+       -> AI ... Policy 는 불일치
+
+    2) AND 있는 경우:
+       AND로 나눈 각 phrase가 기사 안에 모두 존재해야 함.
+       phrase끼리는 떨어져 있어도 되고 순서는 상관없음.
+
+       "AI" AND "Data Center"
+       -> AI + Data Center  : 일치
+       -> AI + Data Centers : 일치
+       -> Data Centers + AI : 일치
+       -> AI만 존재         : 불일치
+    """
+    expressions = parse_keyword_expression(keyword)
+    if not expressions:
         return False
 
-    clean_text = BeautifulSoup(text or "", "html.parser").get_text(" ", strip=True)
+    clean_text = BeautifulSoup(
+        text or "",
+        "html.parser",
+    ).get_text(" ", strip=True)
     clean_text = re.sub(r"\s+", " ", clean_text)
 
-    parts = keyword.split(" ")
-    phrase = r"\s+".join(re.escape(part) for part in parts)
+    return all(
+        _single_phrase_match(expression, clean_text)
+        for expression in expressions
+    )
 
-    # 단어의 일부로 들어간 경우까지 잡지 않도록 경계 검사
-    pattern = rf"(?<!\w){phrase}(?!\w)"
-    return re.search(pattern, clean_text, flags=re.IGNORECASE) is not None
+
+def _google_phrase_query(phrase: str) -> str:
+    """
+    Google News에 보낼 phrase 쿼리.
+    단수/복수형을 OR로 넓혀 검색하고,
+    최종 정확성은 exact_phrase_match에서 다시 검증합니다.
+    """
+    variants = phrase_variants(phrase)
+
+    if not variants:
+        return ""
+
+    quoted = [f'"{variant}"' for variant in variants]
+
+    if len(quoted) == 1:
+        return quoted[0]
+
+    return "(" + " OR ".join(quoted) + ")"
+
+
+def google_keyword_query(keyword: str) -> str:
+    """
+    사용자 키워드를 Google News 검색 문법으로 변환.
+
+    AI Policy
+    -> ("AI Policy" OR "AI Policies")
+
+    "AI" AND "Data Center"
+    -> "AI" AND ("Data Center" OR "Data Centers")
+    """
+    expressions = parse_keyword_expression(keyword)
+
+    if not expressions:
+        return ""
+
+    phrase_queries = [
+        _google_phrase_query(expression)
+        for expression in expressions
+    ]
+    phrase_queries = [q for q in phrase_queries if q]
+
+    if not phrase_queries:
+        return ""
+
+    if len(phrase_queries) == 1:
+        return phrase_queries[0]
+
+    return "(" + " AND ".join(phrase_queries) + ")"
 
 
 # =========================================================
@@ -688,8 +966,19 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
 
         for domain in domains:
             for chunk in chunks:
-                query_parts = [f'"{kw}"' for kw in chunk]
-                kw_query = " OR ".join(query_parts)
+                query_parts = [
+                    google_keyword_query(kw)
+                    for kw in chunk
+                ]
+                query_parts = [
+                    part for part in query_parts if part
+                ]
+                if not query_parts:
+                    continue
+
+                kw_query = " OR ".join(
+                    f"({part})" for part in query_parts
+                )
                 full_query = (
                     f"({kw_query}) site:{domain} "
                     f"when:{SEARCH_LOOKBACK_HOURS}h"
@@ -1151,7 +1440,10 @@ def render_sidebar_settings():
 
         st.sidebar.caption(
             "키워드는 한 줄에 하나씩 입력하세요. "
-            "예: `A B`는 A 또는 B가 아니라 `A B`라는 구문 전체로 검색됩니다."
+            "`AI Policy`는 하나의 연속 구문으로 검색하며 "
+            "`AI Policy / AI Policies`를 자동으로 함께 찾습니다. "
+            '`"AI" AND "Data Center"`처럼 입력하면 AI와 '
+            "`Data Center / Data Centers`가 기사 안에 모두 있어야 검색됩니다."
         )
 
         with st.sidebar.form("settings_form"):
