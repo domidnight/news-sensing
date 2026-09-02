@@ -1685,7 +1685,6 @@ def main():
         )
 
     keyword_map, _ = get_settings()
-    tabs = st.tabs(CATEGORY_NAMES)
 
     period_options = {
         "최근 12시간": 12,
@@ -1700,6 +1699,28 @@ def main():
         "기사 발행/소셜 게시 시각": "published",
         "최초 감지 시각": "detected",
     }
+
+    # 모든 탭이 함께 쓰는 공통 필터.
+    # 한 번 선택하면 다른 탭으로 이동해도 값이 유지됩니다.
+    filter_col1, filter_col2 = st.columns(2)
+
+    with filter_col1:
+        selected_time_basis = st.selectbox(
+            "기간 기준",
+            list(time_basis_options.keys()),
+            index=0,
+            key="global_time_basis",
+        )
+
+    with filter_col2:
+        selected_period = st.selectbox(
+            "기간",
+            list(period_options.keys()),
+            index=2,
+            key="global_period",
+        )
+
+    tabs = st.tabs(CATEGORY_NAMES)
 
     for tab, category_name in zip(tabs, CATEGORY_NAMES):
         with tab:
@@ -1732,24 +1753,6 @@ def main():
                         "관리자 설정에서 키워드를 추가해주세요."
                     )
                     continue
-
-            filter_col1, filter_col2 = st.columns(2)
-
-            with filter_col1:
-                selected_time_basis = st.selectbox(
-                    "기간 기준",
-                    list(time_basis_options.keys()),
-                    index=0,
-                    key=f"time_basis_{category_name}",
-                )
-
-            with filter_col2:
-                selected_period = st.selectbox(
-                    "기간",
-                    list(period_options.keys()),
-                    index=2,
-                    key=f"period_{category_name}",
-                )
 
             articles = get_category_articles(
                 category_name,
