@@ -36,18 +36,27 @@ from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, sessionmaker
 # =========================================================
 
 NEWS_CATEGORY_NAMES = ["AI", "국무부", "국방부", "텍사스", "관세"]
-SOCIAL_CATEGORY_NAMES = ["소셜 (Helberg)", "소셜 (Bessent)"]
+SOCIAL_CATEGORY_NAMES = [
+    "소셜 (Helberg)",
+    "소셜 (Rubio)",
+    "소셜 (Hegseth)",
+]
 CATEGORY_NAMES = NEWS_CATEGORY_NAMES + SOCIAL_CATEGORY_NAMES
 
 # 무료 공개 X 임베드 타임라인 기반 센싱 대상
-# Helberg는 국무부 공식 직책 계정 + 개인 공개 계정을 함께 확인합니다.
+# 각 인물은 공식 직책 계정과 공개 개인 계정을 함께 확인합니다.
 SOCIAL_ACCOUNTS = {
     "소셜 (Helberg)": [
         {"handle": "UnderSecE", "label": "Jacob S. Helberg · 국무부 공식"},
         {"handle": "jacobhelberg", "label": "Jacob Helberg · 개인 공개"},
     ],
-    "소셜 (Bessent)": [
-        {"handle": "SecScottBessent", "label": "Scott Bessent · 재무장관 공식"},
+    "소셜 (Rubio)": [
+        {"handle": "SecRubio", "label": "Marco Rubio · 국무장관 공식"},
+        {"handle": "marcorubio", "label": "Marco Rubio · 개인 공개"},
+    ],
+    "소셜 (Hegseth)": [
+        {"handle": "SecWar", "label": "Pete Hegseth · 장관 공식"},
+        {"handle": "PeteHegseth", "label": "Pete Hegseth · 개인 공개"},
     ],
 }
 KST = timezone(timedelta(hours=9))
@@ -1646,7 +1655,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V2")
     st.caption(
-        "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 2개 탭 / 정확 구문 검색 / "
+        "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / 정확 구문 검색 / "
         "기사·공개 소셜 DB 저장 / 최초 감지 시각 / Gemini 3줄 요약"
     )
 
