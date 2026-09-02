@@ -1323,6 +1323,7 @@ def summarize_pending_articles(limit: int = 10) -> dict:
 def get_category_articles(
     category_name: str,
     period_hours: int | None = 48,
+    time_basis: str = "detected",
     limit: int = 100,
 ):
     with SessionLocal() as session:
@@ -1342,12 +1343,30 @@ def get_category_articles(
 
         if period_hours is not None:
             cutoff = datetime.now(timezone.utc) - timedelta(hours=period_hours)
-            stmt = stmt.where(Article.detected_at >= cutoff)
 
-        stmt = stmt.order_by(
-            Article.published_at.desc().nullslast(),
-            Article.detected_at.desc(),
-        ).limit(limit)
+            if time_basis == "published":
+                # 기사 발행/소셜 게시 시각 기준. 발행 시각이 없는 항목은 제외됩니다.
+                stmt = stmt.where(
+                    Article.published_at.is_not(None),
+                    Article.published_at >= cutoff,
+                )
+            else:
+                # 기존 기본값: 우리 시스템이 처음 발견한 시각 기준
+                stmt = stmt.where(Article.detected_at >= cutoff)
+
+        # 선택한 시간 기준에 맞춰 최신순 정렬
+        if time_basis == "published":
+            stmt = stmt.order_by(
+                Article.published_at.desc().nullslast(),
+                Article.detected_at.desc(),
+            )
+        else:
+            stmt = stmt.order_by(
+                Article.detected_at.desc(),
+                Article.published_at.desc().nullslast(),
+            )
+
+        stmt = stmt.limit(limit)
 
         articles = session.scalars(stmt).all()
 
@@ -1660,11 +1679,17 @@ def main():
     tabs = st.tabs(CATEGORY_NAMES)
 
     period_options = {
+        "최근 12시간": 12,
         "최근 24시간": 24,
         "최근 48시간": 48,
         "최근 7일": 24 * 7,
         "최근 30일": 24 * 30,
         "전체": None,
+    }
+
+    time_basis_options = {
+        "최초 감지 시각": "detected",
+        "기사 발행/소셜 게시 시각": "published",
     }
 
     for tab, category_name in zip(tabs, CATEGORY_NAMES):
@@ -1699,16 +1724,28 @@ def main():
                     )
                     continue
 
-            selected_period = st.selectbox(
-                "기간 (최초 감지 시각 기준)",
-                list(period_options.keys()),
-                index=1,
-                key=f"period_{category_name}",
-            )
+            filter_col1, filter_col2 = st.columns(2)
+
+            with filter_col1:
+                selected_time_basis = st.selectbox(
+                    "기간 기준",
+                    list(time_basis_options.keys()),
+                    index=0,
+                    key=f"time_basis_{category_name}",
+                )
+
+            with filter_col2:
+                selected_period = st.selectbox(
+                    "기간",
+                    list(period_options.keys()),
+                    index=2,
+                    key=f"period_{category_name}",
+                )
 
             articles = get_category_articles(
                 category_name,
                 period_hours=period_options[selected_period],
+                time_basis=time_basis_options[selected_time_basis],
                 limit=100,
             )
 
