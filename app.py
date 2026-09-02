@@ -1697,8 +1697,8 @@ def main():
     }
 
     time_basis_options = {
-        "최초 감지 시각": "detected",
         "기사 발행/소셜 게시 시각": "published",
+        "최초 감지 시각": "detected",
     }
 
     for tab, category_name in zip(tabs, CATEGORY_NAMES):
