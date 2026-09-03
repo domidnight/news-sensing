@@ -78,8 +78,7 @@ def main():
         f"{news_stats.get('google_new_articles', 0)}"
     )
     print(
-        f"Google source rejected  : "
-        f"{news_stats.get('google_source_rejected', 0)}"
+        "Google source rejected  : 0 (SAFE mode: 기존 Google 결과 유지)"
     )
     print(
         f"Total new articles      : "

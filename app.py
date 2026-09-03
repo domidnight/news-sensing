@@ -130,6 +130,7 @@ DIRECT_SOURCE_PROFILES = {
             "https://www.reuters.com/technology/",
             "https://www.reuters.com/business/",
             "https://www.reuters.com/legal/",
+            "https://www.reuters.com/legal/government/",
         ],
     },
     "politico.com": {
@@ -172,6 +173,7 @@ DIRECT_SOURCE_PROFILES = {
         "label": "U.S. Department of State",
         "start_pages": [
             "https://www.state.gov/",
+            "https://www.state.gov/releases/",
         ],
     },
 }
@@ -2428,13 +2430,9 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         for entry in result["entries"]:
             source = get_feed_source(entry)
 
-            if not _google_entry_matches_requested_source(
-                entry,
-                result["domain"],
-            ):
-                stats["google_source_rejected"] += 1
-                continue
-
+            # V3.1 SAFE:
+            # Google News 결과는 V2.x와 동일하게 그대로 유지합니다.
+            # 직접 센싱은 기존 결과를 대체하거나 줄이지 않고 추가만 합니다.
             raw_title = str(
                 entry.get("title", "") or ""
             )
@@ -3084,7 +3082,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "Hybrid Collector: 지정 매체 직접 센싱 + Google News 보조망 / "
+        "Hybrid Collector SAFE: 기존 Google News 유지 + 지정 매체 직접 센싱 추가 / "
         "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
         "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
@@ -3112,11 +3110,6 @@ def main():
                 f"신규 소셜 {social_stats['new_posts']}개"
             )
 
-            if stats.get("google_source_rejected", 0):
-                st.caption(
-                    f"등록 매체 밖 Google News 결과 "
-                    f"{stats['google_source_rejected']}건은 자동 제외했습니다."
-                )
             st.rerun()
 
     with top2:
