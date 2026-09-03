@@ -5,6 +5,7 @@ import hashlib
 import json
 import urllib.parse
 import email.utils
+import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
 from zoneinfo import ZoneInfo
@@ -69,6 +70,160 @@ GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
 RSS_TIMEOUT_SECONDS = int(os.environ.get("RSS_TIMEOUT_SECONDS", "10"))
 RSS_MAX_WORKERS = int(os.environ.get("RSS_MAX_WORKERS", "10"))
+
+# =========================================================
+# V3 Hybrid Collector 설정
+# =========================================================
+
+DIRECT_TIMEOUT_SECONDS = int(
+    os.environ.get("DIRECT_TIMEOUT_SECONDS", "8")
+)
+DIRECT_MAX_WORKERS = int(
+    os.environ.get("DIRECT_MAX_WORKERS", "14")
+)
+DIRECT_MAX_ARTICLES_PER_SOURCE = int(
+    os.environ.get("DIRECT_MAX_ARTICLES_PER_SOURCE", "24")
+)
+DIRECT_SITEMAPS_PER_SOURCE = int(
+    os.environ.get("DIRECT_SITEMAPS_PER_SOURCE", "6")
+)
+DIRECT_LOOKBACK_HOURS = int(
+    os.environ.get(
+        "DIRECT_LOOKBACK_HOURS",
+        str(max(72, SEARCH_LOOKBACK_HOURS + 24)),
+    )
+)
+
+# 아래 9개는 사용자가 설정 목록에 넣었을 때
+# Google News + 공개 웹 직접 센싱을 동시에 수행합니다.
+DIRECT_SOURCE_PROFILES = {
+    "wsj.com": {
+        "label": "The Wall Street Journal",
+        "start_pages": [
+            "https://www.wsj.com/",
+            "https://www.wsj.com/tech",
+            "https://www.wsj.com/politics",
+        ],
+    },
+    "ft.com": {
+        "label": "Financial Times",
+        "start_pages": [
+            "https://www.ft.com/",
+            "https://www.ft.com/world",
+            "https://www.ft.com/technology",
+            "https://www.ft.com/us",
+        ],
+    },
+    "bloomberg.com": {
+        "label": "Bloomberg",
+        "start_pages": [
+            "https://www.bloomberg.com/",
+            "https://www.bloomberg.com/technology",
+            "https://www.bloomberg.com/politics",
+        ],
+    },
+    "reuters.com": {
+        "label": "Reuters",
+        "start_pages": [
+            "https://www.reuters.com/",
+            "https://www.reuters.com/world/us/",
+            "https://www.reuters.com/technology/",
+            "https://www.reuters.com/business/",
+            "https://www.reuters.com/legal/",
+        ],
+    },
+    "politico.com": {
+        "label": "POLITICO",
+        "start_pages": [
+            "https://www.politico.com/",
+            "https://www.politico.com/news",
+        ],
+    },
+    "washingtonpost.com": {
+        "label": "The Washington Post",
+        "start_pages": [
+            "https://www.washingtonpost.com/",
+            "https://www.washingtonpost.com/politics/",
+            "https://www.washingtonpost.com/technology/",
+            "https://www.washingtonpost.com/business/",
+        ],
+    },
+    "axios.com": {
+        "label": "Axios",
+        "start_pages": [
+            "https://www.axios.com/",
+            "https://www.axios.com/technology",
+            "https://www.axios.com/politics-policy",
+            "https://www.axios.com/economy-business",
+        ],
+    },
+    "whitehouse.gov": {
+        "label": "The White House",
+        # news/에는 Releases, Briefings, Presidential Actions,
+        # Fact Sheets, Remarks 등이 함께 노출됩니다.
+        "start_pages": [
+            "https://www.whitehouse.gov/news/",
+            "https://www.whitehouse.gov/releases/",
+            "https://www.whitehouse.gov/briefings-statements/",
+            "https://www.whitehouse.gov/presidential-actions/",
+        ],
+    },
+    "state.gov": {
+        "label": "U.S. Department of State",
+        "start_pages": [
+            "https://www.state.gov/",
+        ],
+    },
+}
+
+# Google News RSS가 site: 필터 밖 매체를 반환하는 경우를 막기 위한
+# 공식/대표 source title 목록
+GOOGLE_SOURCE_ALIASES = {
+    "wsj.com": {
+        "the wall street journal",
+        "wall street journal",
+        "wsj",
+    },
+    "ft.com": {
+        "financial times",
+        "ft",
+    },
+    "bloomberg.com": {
+        "bloomberg",
+        "bloomberg.com",
+    },
+    "reuters.com": {
+        "reuters",
+    },
+    "politico.com": {
+        "politico",
+    },
+    "washingtonpost.com": {
+        "the washington post",
+        "washington post",
+    },
+    "axios.com": {
+        "axios",
+    },
+    "whitehouse.gov": {
+        "the white house",
+        "white house",
+    },
+    "state.gov": {
+        "u.s. department of state",
+        "us department of state",
+        "department of state",
+        "state department",
+    },
+}
+
+COMMON_SITEMAP_PATHS = [
+    "/sitemap.xml",
+    "/sitemap_index.xml",
+    "/sitemap-index.xml",
+    "/news-sitemap.xml",
+    "/sitemap-news.xml",
+]
 
 # Gemini 무료 한도 보호: 자동 10회 + 수동 10회
 AUTO_SUMMARY_DAILY_LIMIT = int(os.environ.get("AUTO_SUMMARY_DAILY_LIMIT", "10"))
@@ -820,6 +975,1174 @@ def update_article_summary(article_id: int, summary: str | None):
             session.commit()
 
 
+
+# =========================================================
+# V3 Hybrid Collector 공통 도우미
+# =========================================================
+
+def _host_from_url(value: str) -> str:
+    try:
+        parsed = urllib.parse.urlparse(value or "")
+        host = (parsed.netloc or "").lower().split("@")[-1].split(":")[0]
+        if host.startswith("www."):
+            host = host[4:]
+        return host
+    except Exception:
+        return ""
+
+
+def _host_matches_domain(host: str, domain: str) -> bool:
+    host = (host or "").lower().strip(".")
+    domain = normalize_domain(domain).split("/")[0].lower().strip(".")
+    return bool(
+        host
+        and domain
+        and (host == domain or host.endswith("." + domain))
+    )
+
+
+def _source_key(value: str) -> str:
+    value = re.sub(r"[^a-z0-9]+", " ", (value or "").lower())
+    return re.sub(r"\s+", " ", value).strip()
+
+
+def _clean_feed_title(title: str, source: str) -> str:
+    """
+    Google News가 제목 뒤에 붙이는 ' - Reuters' 같은 source suffix를 제거.
+    직접 센싱 제목과 중복 제거가 더 잘 되게 합니다.
+    """
+    title = re.sub(r"\s+", " ", title or "").strip()
+    source = re.sub(r"\s+", " ", source or "").strip()
+
+    if not title or not source:
+        return title
+
+    for sep in (" - ", " | ", " — "):
+        suffix = sep + source
+        if title.lower().endswith(suffix.lower()):
+            return title[:-len(suffix)].strip()
+
+    return title
+
+
+def _dedupe_title_key(title: str) -> str:
+    title = BeautifulSoup(title or "", "html.parser").get_text(" ", strip=True)
+    title = title.lower()
+    title = re.sub(r"[^a-z0-9가-힣]+", " ", title)
+    return re.sub(r"\s+", " ", title).strip()
+
+
+def _parse_flexible_datetime(value) -> datetime | None:
+    if not value:
+        return None
+
+    if isinstance(value, datetime):
+        dt = value
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+
+    raw = str(value).strip()
+    if not raw:
+        return None
+
+    # RSS / HTTP 형식
+    try:
+        dt = email.utils.parsedate_to_datetime(raw)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    # ISO 8601
+    try:
+        cleaned = raw.replace("Z", "+00:00")
+        dt = datetime.fromisoformat(cleaned)
+        if dt.tzinfo is None:
+            dt = dt.replace(tzinfo=timezone.utc)
+        return dt.astimezone(timezone.utc)
+    except Exception:
+        pass
+
+    # YYYY-MM-DD
+    match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", raw)
+    if match:
+        try:
+            return datetime(
+                int(match.group(1)),
+                int(match.group(2)),
+                int(match.group(3)),
+                12,
+                0,
+                tzinfo=timezone.utc,
+            )
+        except Exception:
+            pass
+
+    return None
+
+
+def _is_recent_enough(dt: datetime | None, hours: int) -> bool:
+    if not dt:
+        return True
+    cutoff = datetime.now(timezone.utc) - timedelta(hours=hours)
+    return dt >= cutoff
+
+
+def _canonicalize_url(url: str) -> str:
+    """tracking query/fragment를 제거해 URL 중복을 줄입니다."""
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+        if not parsed.scheme or not parsed.netloc:
+            return url or ""
+
+        keep_query = []
+        for key, value in urllib.parse.parse_qsl(
+            parsed.query,
+            keep_blank_values=True,
+        ):
+            if key.lower().startswith("utm_"):
+                continue
+            if key.lower() in {
+                "gclid",
+                "fbclid",
+                "cmpid",
+                "mod",
+                "output",
+            }:
+                continue
+            keep_query.append((key, value))
+
+        return urllib.parse.urlunparse(
+            (
+                parsed.scheme,
+                parsed.netloc,
+                parsed.path,
+                parsed.params,
+                urllib.parse.urlencode(keep_query),
+                "",
+            )
+        )
+    except Exception:
+        return url or ""
+
+
+def _is_likely_article_url(url: str, domain: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url)
+        if parsed.scheme not in {"http", "https"}:
+            return False
+
+        host = _host_from_url(url)
+        if not _host_matches_domain(host, domain):
+            return False
+
+        path = urllib.parse.unquote(parsed.path or "")
+        path_lower = path.lower()
+
+        if not path or path == "/":
+            return False
+
+        blocked_fragments = (
+            "/author/",
+            "/authors/",
+            "/tag/",
+            "/tags/",
+            "/topic/",
+            "/topics/",
+            "/search",
+            "/login",
+            "/signin",
+            "/subscribe",
+            "/account",
+            "/privacy",
+            "/terms",
+            "/contact",
+            "/about",
+            "/newsletters",
+            "/podcasts",
+            "/video/",
+            "/videos/",
+        )
+        if any(fragment in path_lower for fragment in blocked_fragments):
+            return False
+
+        if re.search(
+            r"\.(jpg|jpeg|png|gif|webp|svg|pdf|xml|rss|zip)$",
+            path_lower,
+        ):
+            return False
+
+        segments = [s for s in path.split("/") if s]
+        if len(segments) < 2:
+            return False
+
+        # 날짜 URL, FT content UUID, 긴 기사 slug 등을 허용
+        if re.search(r"/20\d{2}/", path):
+            return True
+        if "/content/" in path_lower:
+            return True
+        if "/news/articles/" in path_lower:
+            return True
+        if "/releases/" in path_lower:
+            return True
+        if "/briefings-statements/" in path_lower:
+            return True
+        if "/presidential-actions/" in path_lower:
+            return True
+
+        last = segments[-1]
+        return len(last) >= 24
+
+    except Exception:
+        return False
+
+
+def _safe_get(url: str, timeout: int | None = None):
+    return requests.get(
+        url,
+        timeout=timeout or DIRECT_TIMEOUT_SECONDS,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 (KHTML, like Gecko) "
+                "Chrome/124.0 Safari/537.36 "
+                "GPA-News-Sensing/3.0"
+            ),
+            "Accept-Language": "en-US,en;q=0.9",
+        },
+        allow_redirects=True,
+    )
+
+
+def _extract_sitemaps_from_robots(content: str) -> list[str]:
+    result = []
+    for line in (content or "").splitlines():
+        if line.lower().startswith("sitemap:"):
+            value = line.split(":", 1)[1].strip()
+            if value.startswith("http"):
+                result.append(value)
+    return result
+
+
+def _xml_local_name(tag: str) -> str:
+    return (tag or "").split("}")[-1].lower()
+
+
+def _parse_sitemap_xml(content: bytes) -> dict:
+    """
+    반환:
+    {
+      "type": "index" | "urlset" | "unknown",
+      "items": [{"loc": ..., "lastmod": datetime|None}, ...]
+    }
+    """
+    try:
+        root = ET.fromstring(content)
+    except Exception:
+        return {"type": "unknown", "items": []}
+
+    root_type = _xml_local_name(root.tag)
+    items = []
+
+    for child in list(root):
+        loc = None
+        lastmod = None
+
+        for node in list(child):
+            name = _xml_local_name(node.tag)
+            text = (node.text or "").strip()
+
+            if name == "loc":
+                loc = text
+            elif name in {"lastmod", "publication_date"}:
+                parsed = _parse_flexible_datetime(text)
+                if parsed:
+                    lastmod = parsed
+
+        if loc:
+            items.append(
+                {
+                    "loc": loc,
+                    "lastmod": lastmod,
+                }
+            )
+
+    if root_type == "sitemapindex":
+        kind = "index"
+    elif root_type == "urlset":
+        kind = "urlset"
+    else:
+        kind = "unknown"
+
+    return {"type": kind, "items": items}
+
+
+def _sitemap_child_score(item: dict) -> tuple:
+    loc = (item.get("loc") or "").lower()
+    lastmod = item.get("lastmod")
+
+    score = 0
+    for token in (
+        "news",
+        "article",
+        "post",
+        "story",
+        "release",
+        "press",
+        "2026",
+    ):
+        if token in loc:
+            score += 3
+
+    if lastmod:
+        age = datetime.now(timezone.utc) - lastmod
+        if age <= timedelta(days=2):
+            score += 10
+        elif age <= timedelta(days=7):
+            score += 6
+        elif age <= timedelta(days=31):
+            score += 2
+
+    return (score, lastmod or datetime.min.replace(tzinfo=timezone.utc))
+
+
+def _extract_listing_links(
+    html: str,
+    base_url: str,
+    domain: str,
+) -> list[str]:
+    soup = BeautifulSoup(html or "", "html.parser")
+    links = []
+
+    # canonical/amp 링크는 candidate가 아니라 현재 listing 자신일 수 있어 제외
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        absolute = urllib.parse.urljoin(base_url, href)
+        absolute = _canonicalize_url(absolute)
+
+        if _is_likely_article_url(absolute, domain):
+            links.append(absolute)
+
+    # 순서 유지 중복 제거
+    return list(dict.fromkeys(links))
+
+
+def _discover_direct_candidates_for_source(
+    domain: str,
+    profile: dict,
+) -> dict:
+    """
+    홈페이지/섹션 + robots.txt + sitemap을 이용해
+    직접 기사 URL 후보를 모읍니다.
+    """
+    start_pages = profile.get("start_pages", [])
+    probe_urls = [
+        f"https://{domain}/robots.txt",
+        *start_pages,
+        *[
+            f"https://{domain}{path}"
+            for path in COMMON_SITEMAP_PATHS
+        ],
+    ]
+
+    candidates = []
+    sitemap_urls = []
+    successful_probes = 0
+
+    # 1차 probe
+    workers = max(1, min(8, len(probe_urls)))
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_safe_get, url): url
+            for url in probe_urls
+        }
+
+        for future in as_completed(future_map):
+            url = future_map[future]
+
+            try:
+                response = future.result()
+                if response.status_code >= 400:
+                    continue
+
+                successful_probes += 1
+                ctype = (
+                    response.headers.get("content-type", "")
+                    .lower()
+                )
+
+                if url.endswith("/robots.txt"):
+                    sitemap_urls.extend(
+                        _extract_sitemaps_from_robots(
+                            response.text
+                        )
+                    )
+                    continue
+
+                is_xml = (
+                    "xml" in ctype
+                    or url.endswith(".xml")
+                    or response.content.lstrip().startswith(b"<?xml")
+                )
+
+                if is_xml:
+                    parsed = _parse_sitemap_xml(response.content)
+                    if parsed["type"] == "index":
+                        ranked = sorted(
+                            parsed["items"],
+                            key=_sitemap_child_score,
+                            reverse=True,
+                        )
+                        sitemap_urls.extend(
+                            item["loc"]
+                            for item in ranked[
+                                :DIRECT_SITEMAPS_PER_SOURCE
+                            ]
+                        )
+                    elif parsed["type"] == "urlset":
+                        for item in parsed["items"]:
+                            if not _is_recent_enough(
+                                item["lastmod"],
+                                DIRECT_LOOKBACK_HOURS,
+                            ):
+                                continue
+                            if _is_likely_article_url(
+                                item["loc"],
+                                domain,
+                            ):
+                                candidates.append(
+                                    _canonicalize_url(
+                                        item["loc"]
+                                    )
+                                )
+                    continue
+
+                # 일반 HTML listing
+                candidates.extend(
+                    _extract_listing_links(
+                        response.text,
+                        response.url or url,
+                        domain,
+                    )
+                )
+
+            except Exception:
+                continue
+
+    # Sitemap URL 중복 제거 + 동일 도메인만
+    sitemap_urls = [
+        u for u in dict.fromkeys(sitemap_urls)
+        if _host_matches_domain(_host_from_url(u), domain)
+    ][:DIRECT_SITEMAPS_PER_SOURCE * 2]
+
+    # 2차 sitemap probe
+    if sitemap_urls:
+        workers = max(
+            1,
+            min(
+                DIRECT_MAX_WORKERS,
+                len(sitemap_urls),
+            ),
+        )
+
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            future_map = {
+                executor.submit(_safe_get, url): url
+                for url in sitemap_urls
+            }
+
+            nested_sitemaps = []
+
+            for future in as_completed(future_map):
+                try:
+                    response = future.result()
+                    if response.status_code >= 400:
+                        continue
+
+                    successful_probes += 1
+                    parsed = _parse_sitemap_xml(
+                        response.content
+                    )
+
+                    if parsed["type"] == "urlset":
+                        recent_items = sorted(
+                            parsed["items"],
+                            key=lambda item: (
+                                item["lastmod"]
+                                or datetime.min.replace(
+                                    tzinfo=timezone.utc
+                                )
+                            ),
+                            reverse=True,
+                        )
+
+                        for item in recent_items[:150]:
+                            if not _is_recent_enough(
+                                item["lastmod"],
+                                DIRECT_LOOKBACK_HOURS,
+                            ):
+                                continue
+
+                            url = _canonicalize_url(
+                                item["loc"]
+                            )
+                            if _is_likely_article_url(
+                                url,
+                                domain,
+                            ):
+                                candidates.append(url)
+
+                    elif parsed["type"] == "index":
+                        ranked = sorted(
+                            parsed["items"],
+                            key=_sitemap_child_score,
+                            reverse=True,
+                        )
+                        nested_sitemaps.extend(
+                            item["loc"]
+                            for item in ranked[
+                                :DIRECT_SITEMAPS_PER_SOURCE
+                            ]
+                        )
+
+                except Exception:
+                    continue
+
+            # sitemap index -> sitemap 한 단계 더
+            nested_sitemaps = [
+                u for u in dict.fromkeys(nested_sitemaps)
+                if _host_matches_domain(
+                    _host_from_url(u),
+                    domain,
+                )
+            ][:DIRECT_SITEMAPS_PER_SOURCE]
+
+            if nested_sitemaps:
+                with ThreadPoolExecutor(
+                    max_workers=min(
+                        DIRECT_MAX_WORKERS,
+                        len(nested_sitemaps),
+                    )
+                ) as executor:
+                    future_map = {
+                        executor.submit(
+                            _safe_get,
+                            url,
+                        ): url
+                        for url in nested_sitemaps
+                    }
+
+                    for future in as_completed(future_map):
+                        try:
+                            response = future.result()
+                            if response.status_code >= 400:
+                                continue
+
+                            successful_probes += 1
+                            parsed = _parse_sitemap_xml(
+                                response.content
+                            )
+
+                            if parsed["type"] != "urlset":
+                                continue
+
+                            recent_items = sorted(
+                                parsed["items"],
+                                key=lambda item: (
+                                    item["lastmod"]
+                                    or datetime.min.replace(
+                                        tzinfo=timezone.utc
+                                    )
+                                ),
+                                reverse=True,
+                            )
+
+                            for item in recent_items[:150]:
+                                if not _is_recent_enough(
+                                    item["lastmod"],
+                                    DIRECT_LOOKBACK_HOURS,
+                                ):
+                                    continue
+
+                                url = _canonicalize_url(
+                                    item["loc"]
+                                )
+                                if _is_likely_article_url(
+                                    url,
+                                    domain,
+                                ):
+                                    candidates.append(url)
+
+                        except Exception:
+                            continue
+
+    # URL 순서 유지 중복 제거.
+    # start page에서 나온 최신 링크가 앞쪽에 있으므로 먼저 보존.
+    candidates = list(dict.fromkeys(candidates))
+
+    return {
+        "domain": domain,
+        "candidates": candidates[
+            :DIRECT_MAX_ARTICLES_PER_SOURCE
+        ],
+        "successful_probes": successful_probes,
+    }
+
+
+def _extract_jsonld_objects(soup: BeautifulSoup) -> list:
+    objects = []
+
+    for script in soup.find_all(
+        "script",
+        attrs={"type": "application/ld+json"},
+    ):
+        raw = script.string or script.get_text()
+        if not raw:
+            continue
+
+        try:
+            data = json.loads(raw)
+        except Exception:
+            continue
+
+        queue = [data]
+        while queue:
+            current = queue.pop()
+
+            if isinstance(current, dict):
+                objects.append(current)
+
+                graph = current.get("@graph")
+                if isinstance(graph, list):
+                    queue.extend(graph)
+
+            elif isinstance(current, list):
+                queue.extend(current)
+
+    return objects
+
+
+def _meta_content(
+    soup: BeautifulSoup,
+    *,
+    property_name: str | None = None,
+    name: str | None = None,
+) -> str:
+    attrs = {}
+
+    if property_name:
+        attrs["property"] = property_name
+    elif name:
+        attrs["name"] = name
+    else:
+        return ""
+
+    tag = soup.find("meta", attrs=attrs)
+    if not tag:
+        return ""
+
+    return str(tag.get("content") or "").strip()
+
+
+def _extract_direct_article(url: str, domain: str, label: str) -> dict:
+    """
+    공개 웹페이지에서 제목/날짜/본문(가능한 범위)을 직접 추출합니다.
+    paywall/봇차단으로 읽지 못하면 error를 반환하고 Google News 보조망에 맡깁니다.
+    """
+    try:
+        response = _safe_get(url)
+        if response.status_code >= 400:
+            return {
+                "url": url,
+                "error": f"HTTP {response.status_code}",
+            }
+
+        final_url = _canonicalize_url(
+            response.url or url
+        )
+
+        if not _host_matches_domain(
+            _host_from_url(final_url),
+            domain,
+        ):
+            return {
+                "url": url,
+                "error": "redirected outside target domain",
+            }
+
+        soup = BeautifulSoup(
+            response.text,
+            "html.parser",
+        )
+
+        canonical = soup.find(
+            "link",
+            attrs={"rel": "canonical"},
+        )
+        if canonical and canonical.get("href"):
+            candidate_canonical = _canonicalize_url(
+                urllib.parse.urljoin(
+                    final_url,
+                    canonical.get("href"),
+                )
+            )
+            if _host_matches_domain(
+                _host_from_url(candidate_canonical),
+                domain,
+            ):
+                final_url = candidate_canonical
+
+        title = (
+            _meta_content(
+                soup,
+                property_name="og:title",
+            )
+            or _meta_content(
+                soup,
+                name="twitter:title",
+            )
+            or (
+                soup.title.get_text(" ", strip=True)
+                if soup.title
+                else ""
+            )
+        )
+        title = re.sub(r"\s+", " ", title).strip()
+
+        description = (
+            _meta_content(
+                soup,
+                property_name="og:description",
+            )
+            or _meta_content(
+                soup,
+                name="description",
+            )
+            or _meta_content(
+                soup,
+                name="twitter:description",
+            )
+        )
+
+        published_at = None
+        article_body = ""
+
+        jsonld_objects = _extract_jsonld_objects(soup)
+
+        for obj in jsonld_objects:
+            obj_type = obj.get("@type")
+            if isinstance(obj_type, list):
+                types = {
+                    str(v).lower()
+                    for v in obj_type
+                }
+            else:
+                types = {str(obj_type or "").lower()}
+
+            if types.intersection(
+                {
+                    "newsarticle",
+                    "article",
+                    "reportagenewsarticle",
+                    "analysisnewsarticle",
+                }
+            ):
+                if not title:
+                    title = str(
+                        obj.get("headline") or ""
+                    ).strip()
+
+                if not published_at:
+                    published_at = (
+                        _parse_flexible_datetime(
+                            obj.get("datePublished")
+                        )
+                        or _parse_flexible_datetime(
+                            obj.get("dateCreated")
+                        )
+                    )
+
+                if not description:
+                    description = str(
+                        obj.get("description") or ""
+                    ).strip()
+
+                if not article_body:
+                    article_body = str(
+                        obj.get("articleBody") or ""
+                    ).strip()
+
+        if not published_at:
+            for key_type, key in (
+                ("property", "article:published_time"),
+                ("property", "og:published_time"),
+                ("name", "date"),
+                ("name", "parsely-pub-date"),
+                ("name", "sailthru.date"),
+            ):
+                if key_type == "property":
+                    raw = _meta_content(
+                        soup,
+                        property_name=key,
+                    )
+                else:
+                    raw = _meta_content(
+                        soup,
+                        name=key,
+                    )
+
+                published_at = _parse_flexible_datetime(
+                    raw
+                )
+                if published_at:
+                    break
+
+        if not published_at:
+            time_tag = soup.find(
+                "time",
+                attrs={"datetime": True},
+            )
+            if time_tag:
+                published_at = _parse_flexible_datetime(
+                    time_tag.get("datetime")
+                )
+
+        # JSON-LD articleBody가 없으면 공개된 article/main 문단에서 텍스트 추출
+        if not article_body:
+            container = (
+                soup.find("article")
+                or soup.find("main")
+                or soup
+            )
+            paragraphs = []
+
+            for p in container.find_all("p"):
+                text = re.sub(
+                    r"\s+",
+                    " ",
+                    p.get_text(" ", strip=True),
+                ).strip()
+
+                if len(text) >= 30:
+                    paragraphs.append(text)
+
+                if sum(
+                    len(v) for v in paragraphs
+                ) >= 14000:
+                    break
+
+            article_body = "\n".join(paragraphs)
+
+        combined = "\n".join(
+            value
+            for value in (
+                title,
+                description,
+                article_body,
+            )
+            if value
+        )
+        combined = combined[:16000]
+
+        if not title:
+            return {
+                "url": final_url,
+                "error": "no title",
+            }
+
+        # direct 후보라도 실제 발행일이 너무 오래됐으면 제외
+        if (
+            published_at
+            and not _is_recent_enough(
+                published_at,
+                DIRECT_LOOKBACK_HOURS,
+            )
+        ):
+            return {
+                "url": final_url,
+                "skip": "old",
+            }
+
+        return {
+            "url": final_url,
+            "title": title,
+            "description": (
+                description
+                or article_body[:2500]
+            ),
+            "search_text": combined,
+            "published_at": published_at,
+            "source": label,
+            "error": None,
+        }
+
+    except Exception as exc:
+        return {
+            "url": url,
+            "error": str(exc),
+        }
+
+
+def collect_direct_sources(
+    keyword_map: dict[str, list[str]],
+    enabled_domains: list[str],
+) -> dict:
+    """
+    9개 핵심 출처를 직접 확인해 Google News 누락을 보완합니다.
+    직접 접근이 막힌 매체는 실패해도 전체 수집은 계속되고,
+    기존 Google News RSS가 보조망 역할을 합니다.
+    """
+    profiles = {}
+
+    for configured in enabled_domains:
+        base_domain = normalize_domain(
+            configured
+        ).split("/")[0]
+
+        profile = DIRECT_SOURCE_PROFILES.get(
+            base_domain
+        )
+        if profile:
+            profiles[base_domain] = profile
+
+    stats = {
+        "sources_enabled": len(profiles),
+        "sources_checked": 0,
+        "candidate_urls": 0,
+        "pages_checked": 0,
+        "matched_articles": 0,
+        "new_articles": 0,
+        "page_failures": 0,
+        "source_failures": 0,
+    }
+
+    if not profiles:
+        return stats
+
+    discovery_results = []
+
+    with ThreadPoolExecutor(
+        max_workers=min(
+            DIRECT_MAX_WORKERS,
+            len(profiles),
+        )
+    ) as executor:
+        futures = {
+            executor.submit(
+                _discover_direct_candidates_for_source,
+                domain,
+                profile,
+            ): domain
+            for domain, profile in profiles.items()
+        }
+
+        for future in as_completed(futures):
+            domain = futures[future]
+
+            try:
+                result = future.result()
+                discovery_results.append(result)
+
+                if result["successful_probes"] > 0:
+                    stats["sources_checked"] += 1
+                else:
+                    stats["source_failures"] += 1
+
+            except Exception as exc:
+                print(
+                    f"[Direct discovery error] "
+                    f"{domain}: {exc}"
+                )
+                stats["source_failures"] += 1
+
+    page_jobs = []
+
+    for result in discovery_results:
+        domain = result["domain"]
+        profile = profiles[domain]
+
+        for url in result["candidates"]:
+            page_jobs.append(
+                (
+                    url,
+                    domain,
+                    profile["label"],
+                )
+            )
+
+    # URL 기준 중복 제거
+    unique_jobs = {}
+    for url, domain, label in page_jobs:
+        unique_jobs[url] = (
+            url,
+            domain,
+            label,
+        )
+
+    page_jobs = list(unique_jobs.values())
+    stats["candidate_urls"] = len(page_jobs)
+
+    if not page_jobs:
+        return stats
+
+    new_article_ids = set()
+
+    with ThreadPoolExecutor(
+        max_workers=min(
+            DIRECT_MAX_WORKERS,
+            len(page_jobs),
+        )
+    ) as executor:
+        futures = {
+            executor.submit(
+                _extract_direct_article,
+                url,
+                domain,
+                label,
+            ): (url, domain)
+            for url, domain, label in page_jobs
+        }
+
+        for future in as_completed(futures):
+            url, domain = futures[future]
+
+            try:
+                article_data = future.result()
+            except Exception as exc:
+                stats["page_failures"] += 1
+                print(
+                    f"[Direct page error] "
+                    f"{domain}: {exc}"
+                )
+                continue
+
+            if article_data.get("skip"):
+                continue
+
+            if article_data.get("error"):
+                stats["page_failures"] += 1
+                continue
+
+            stats["pages_checked"] += 1
+            search_text = article_data[
+                "search_text"
+            ]
+
+            for category_name in NEWS_CATEGORY_NAMES:
+                category_keywords = keyword_map.get(
+                    category_name,
+                    [],
+                )
+                if not category_keywords:
+                    continue
+
+                matched_keywords = [
+                    kw
+                    for kw in category_keywords
+                    if exact_phrase_match(
+                        kw,
+                        search_text,
+                    )
+                ]
+
+                if not matched_keywords:
+                    continue
+
+                stats["matched_articles"] += 1
+
+                try:
+                    article_id, is_new, _ = (
+                        upsert_article(
+                            category_name=category_name,
+                            title=article_data["title"],
+                            link=article_data["url"],
+                            source=article_data["source"],
+                            published_at=article_data[
+                                "published_at"
+                            ],
+                            description=article_data[
+                                "description"
+                            ],
+                            matched_keywords=matched_keywords,
+                        )
+                    )
+
+                    if (
+                        article_id
+                        and is_new
+                        and article_id
+                        not in new_article_ids
+                    ):
+                        new_article_ids.add(
+                            article_id
+                        )
+                        stats["new_articles"] += 1
+
+                except Exception as exc:
+                    print(
+                        f"[Direct save error] "
+                        f"{domain}: {exc}"
+                    )
+
+    return stats
+
+
+def _feed_source_href(entry) -> str:
+    try:
+        source = entry.get("source")
+        if not source:
+            return ""
+
+        return str(
+            source.get("href")
+            or source.get("url")
+            or ""
+        ).strip()
+    except Exception:
+        return ""
+
+
+def _google_entry_matches_requested_source(
+    entry,
+    requested_domain: str,
+) -> bool:
+    """
+    Google News가 site:reuters.com 검색 중 Daily Signal 같은
+    다른 매체를 섞어 반환하는 것을 최종 차단합니다.
+    """
+    base_domain = normalize_domain(
+        requested_domain
+    ).split("/")[0]
+
+    source_href = _feed_source_href(entry)
+    if source_href:
+        return _host_matches_domain(
+            _host_from_url(source_href),
+            base_domain,
+        )
+
+    # source URL이 없을 때는 알려진 9개 매체에 한해 이름 검증
+    aliases = GOOGLE_SOURCE_ALIASES.get(
+        base_domain
+    )
+    if aliases:
+        source_title = _source_key(
+            get_feed_source(entry)
+        )
+        return source_title in {
+            _source_key(alias)
+            for alias in aliases
+        }
+
+    # 기타 사용자가 직접 추가한 사이트는 기존 동작 유지
+    return True
+
+
 # =========================================================
 # 5. Google News RSS 수집
 # =========================================================
@@ -877,6 +2200,36 @@ def upsert_article(
             select(Article).where(Article.url_hash == url_hash)
         )
 
+        # Google News redirect URL과 직접 원문 URL이 달라도
+        # 같은 기사 제목이면 최근 DB 기사와 합쳐 중복을 줄입니다.
+        if article is None and title:
+            title_key = _dedupe_title_key(title)
+            recent_cutoff = (
+                datetime.now(timezone.utc)
+                - timedelta(days=7)
+            )
+
+            recent_articles = session.scalars(
+                select(Article)
+                .where(
+                    Article.detected_at >= recent_cutoff
+                )
+                .order_by(
+                    Article.detected_at.desc()
+                )
+                .limit(1200)
+            ).all()
+
+            for candidate in recent_articles:
+                if (
+                    _dedupe_title_key(
+                        candidate.title
+                    )
+                    == title_key
+                ):
+                    article = candidate
+                    break
+
         is_new = False
 
         if article is None:
@@ -897,10 +2250,40 @@ def upsert_article(
             # 기존 기사라도 더 좋은 정보가 있으면 보완
             if not article.published_at and published_at:
                 article.published_at = published_at
-            if not article.description and description:
+
+            if description and (
+                not article.description
+                or len(description)
+                > len(article.description)
+            ):
                 article.description = description
-            if (not article.source or article.source == "Unknown") and source:
+
+            if source and (
+                not article.source
+                or article.source == "Unknown"
+            ):
                 article.source = source
+
+            # Google News redirect 대신 직접 원문 URL이 들어오면 원문으로 교체
+            old_host = _host_from_url(article.link)
+            new_host = _host_from_url(link)
+
+            if (
+                old_host == "news.google.com"
+                and new_host
+                and new_host != "news.google.com"
+            ):
+                new_hash = article_hash(link)
+                hash_conflict = session.scalar(
+                    select(Article.id).where(
+                        Article.url_hash == new_hash,
+                        Article.id != article.id,
+                    )
+                )
+
+                if not hash_conflict:
+                    article.link = link
+                    article.url_hash = new_hash
 
         for kw in matched_keywords:
             exists = session.scalar(
@@ -956,9 +2339,23 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         "feeds_checked": 0,
         "matched_articles": 0,
         "new_articles": 0,
+        "google_new_articles": 0,
+        "google_source_rejected": 0,
         "summaries_created": 0,
         "errors": 0,
+        "direct": {},
     }
+
+    # V3: 직접 센싱을 먼저 수행해 원문 URL/본문을 우선 확보.
+    # 직접 접근이 막혀도 아래 Google News RSS가 계속 보조망 역할을 합니다.
+    direct_stats = collect_direct_sources(
+        keyword_map=keyword_map,
+        enabled_domains=domains,
+    )
+    stats["direct"] = direct_stats
+    stats["new_articles"] += direct_stats[
+        "new_articles"
+    ]
 
     chunk_size = 4
     jobs = []
@@ -1029,14 +2426,41 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         category_keywords = result["category_keywords"]
 
         for entry in result["entries"]:
-            title = str(entry.get("title", "") or "")
-            description_raw = str(entry.get("description", "") or "")
-            link = str(entry.get("link", "") or "")
+            source = get_feed_source(entry)
 
-            if not link or link in seen_links_by_category[category_name]:
+            if not _google_entry_matches_requested_source(
+                entry,
+                result["domain"],
+            ):
+                stats["google_source_rejected"] += 1
                 continue
 
-            text_to_search = f"{title} {description_raw}"
+            raw_title = str(
+                entry.get("title", "") or ""
+            )
+            title = _clean_feed_title(
+                raw_title,
+                source,
+            )
+            description_raw = str(
+                entry.get("description", "") or ""
+            )
+            link = str(
+                entry.get("link", "") or ""
+            )
+
+            if (
+                not link
+                or link
+                in seen_links_by_category[
+                    category_name
+                ]
+            ):
+                continue
+
+            text_to_search = (
+                f"{title} {description_raw}"
+            )
             matched_keywords = [
                 kw for kw in category_keywords
                 if exact_phrase_match(kw, text_to_search)
@@ -1048,8 +2472,12 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
             seen_links_by_category[category_name].add(link)
             stats["matched_articles"] += 1
 
-            source = get_feed_source(entry)
-            published_at = parse_published(str(entry.get("published", "") or ""))
+            published_at = parse_published(
+                str(
+                    entry.get("published", "")
+                    or ""
+                )
+            )
             clean_description = BeautifulSoup(
                 description_raw, "html.parser"
             ).get_text(" ", strip=True)
@@ -1067,6 +2495,7 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
 
                 if is_new:
                     stats["new_articles"] += 1
+                    stats["google_new_articles"] += 1
 
                 if article_id and needs_summary and generate_summaries:
                     summary_queue[article_id] = (title, clean_description)
@@ -1646,17 +3075,18 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V2",
+        page_title="GPA 뉴스 센싱 대시보드 V3",
         page_icon="📰",
         layout="wide",
     )
 
     init_db()
 
-    st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V2")
+    st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / 정확 구문 검색 / "
-        "기사·공개 소셜 DB 저장 / 최초 감지 시각 / Gemini 3줄 요약"
+        "Hybrid Collector: 지정 매체 직접 센싱 + Google News 보조망 / "
+        "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
+        "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
 
     render_sidebar_settings()
@@ -1665,15 +3095,28 @@ def main():
 
     with top1:
         if st.button("🔄 지금 새 뉴스·소셜 수집", use_container_width=True):
-            with st.spinner("뉴스와 공개 소셜 계정을 빠르게 확인하고 있습니다..."):
-                stats = collect_all_categories(generate_summaries=False)
+            with st.spinner(
+                "Hybrid 방식으로 지정 매체·Google News·공개 소셜을 확인하고 있습니다..."
+            ):
+                stats = collect_all_categories(
+                    generate_summaries=False
+                )
                 social_stats = collect_social_posts()
 
+            direct = stats.get("direct", {})
+
             st.success(
-                f"빠른 수집 완료: 신규 기사 {stats['new_articles']}개 / "
-                f"신규 소셜 {social_stats['new_posts']}개 / "
-                f"오류 {stats['errors'] + social_stats['errors']}건"
+                f"Hybrid 수집 완료: 신규 기사 {stats['new_articles']}개 "
+                f"(직접 {direct.get('new_articles', 0)} / "
+                f"Google {stats.get('google_new_articles', 0)}) · "
+                f"신규 소셜 {social_stats['new_posts']}개"
             )
+
+            if stats.get("google_source_rejected", 0):
+                st.caption(
+                    f"등록 매체 밖 Google News 결과 "
+                    f"{stats['google_source_rejected']}건은 자동 제외했습니다."
+                )
             st.rerun()
 
     with top2:
