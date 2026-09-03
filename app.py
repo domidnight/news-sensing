@@ -2992,6 +2992,206 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
     return stats
 
 
+def _fetch_x_profile_timeline(handle: str) -> list[dict]:
+    """
+    X의 공개 임베드 타임라인(syndication)에서 공개 프로필 게시물을 가져옵니다.
+    API Key가 필요 없는 무료 경로지만 X가 내부 구조를 바꾸면 동작이 깨질 수 있습니다.
+    """
+    url = (
+        "https://syndication.twitter.com/srv/"
+        f"timeline-profile/screen-name/{handle}"
+    )
+
+    response = requests.get(
+        url,
+        timeout=RSS_TIMEOUT_SECONDS,
+        headers={
+            "User-Agent": (
+                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+            )
+        },
+    )
+    response.raise_for_status()
+
+    soup = BeautifulSoup(response.text, "html.parser")
+    script = soup.find("script", id="__NEXT_DATA__")
+    if not script:
+        raise ValueError("X 공개 타임라인 데이터(__NEXT_DATA__)를 찾지 못했습니다.")
+
+    raw_json = script.string or script.get_text()
+    data = json.loads(raw_json)
+
+    page_props = data.get("props", {}).get("pageProps", {})
+    entries = page_props.get("timeline", {}).get("entries", [])
+
+    posts = []
+
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+
+        content = entry.get("content") or {}
+        tweet = content.get("tweet") if isinstance(content, dict) else None
+        if not isinstance(tweet, dict):
+            continue
+
+        tweet_id = str(tweet.get("id_str") or tweet.get("id") or "").strip()
+        full_text = str(
+            tweet.get("full_text")
+            or tweet.get("text")
+            or ""
+        ).strip()
+
+        if not tweet_id or not full_text:
+            continue
+
+        user = tweet.get("user") or {}
+        author_handle = str(
+            user.get("screen_name") or handle
+        ).strip()
+        author_name = str(
+            user.get("name") or author_handle
+        ).strip()
+
+        permalink = str(tweet.get("permalink") or "").strip()
+        if permalink.startswith("/"):
+            permalink = "https://x.com" + permalink
+        elif not permalink.startswith("http"):
+            permalink = f"https://x.com/{author_handle}/status/{tweet_id}"
+
+        posts.append(
+            {
+                "id": tweet_id,
+                "text": full_text,
+                "link": permalink,
+                "published_at": _parse_x_created_at(
+                    tweet.get("created_at", "")
+                ),
+                "author_handle": author_handle,
+                "author_name": author_name,
+            }
+        )
+
+    return posts
+
+
+def collect_social_posts() -> dict:
+    """
+    Helberg/Bessent 공개 X 계정을 무료 best-effort 방식으로 센싱합니다.
+    새 게시물은 기존 articles/article_matches 테이블에 함께 저장됩니다.
+    """
+    stats = {
+        "profiles_checked": 0,
+        "matched_posts": 0,
+        "new_posts": 0,
+        "errors": 0,
+    }
+
+    for category_name, accounts in SOCIAL_ACCOUNTS.items():
+        for account in accounts:
+            handle = account["handle"]
+            label = account["label"]
+
+            try:
+                posts = _fetch_x_profile_timeline(handle)
+                stats["profiles_checked"] += 1
+            except Exception as exc:
+                print(f"[Social feed error] @{handle}: {exc}")
+                stats["errors"] += 1
+                continue
+
+            for post in posts:
+                stats["matched_posts"] += 1
+
+                # 제목은 목록 가독성을 위해 짧게, 원문은 description에 전체 저장
+                one_line = re.sub(r"\s+", " ", post["text"]).strip()
+                title = (
+                    one_line[:150] + "…"
+                    if len(one_line) > 150
+                    else one_line
+                )
+
+                try:
+                    _, is_new, _ = upsert_article(
+                        category_name=category_name,
+                        title=title,
+                        link=post["link"],
+                        source=f"X · @{handle}",
+                        published_at=post["published_at"],
+                        description=post["text"],
+                        matched_keywords=[f"@{handle}"],
+                    )
+
+                    if is_new:
+                        stats["new_posts"] += 1
+
+                except Exception as exc:
+                    print(f"[Social save error] @{handle}: {exc}")
+                    stats["errors"] += 1
+
+    return stats
+
+
+def summarize_pending_articles(limit: int = 10) -> dict:
+    """
+    가장 최근의 미요약 콘텐츠를 우선 자동 요약하되,
+    하루 AUTO_SUMMARY_DAILY_LIMIT(기본 10회)을 절대 넘지 않습니다.
+    """
+    stats = {
+        "checked": 0,
+        "summarized": 0,
+        "failed": 0,
+        "skipped_by_daily_limit": 0,
+        "external_quota_exhausted": False,
+    }
+
+    remaining_auto = remaining_summary_quota("auto")
+    allowed = min(limit, remaining_auto)
+
+    if allowed <= 0:
+        stats["skipped_by_daily_limit"] = limit
+        return stats
+
+    with SessionLocal() as session:
+        pending = session.scalars(
+            select(Article)
+            .where(Article.summary.is_(None))
+            .order_by(Article.detected_at.desc())
+            .limit(allowed)
+        ).all()
+
+        items = [
+            {
+                "id": article.id,
+                "title": article.title,
+                "description": article.description,
+            }
+            for article in pending
+        ]
+
+    for item in items:
+        if remaining_summary_quota("auto") <= 0:
+            break
+
+        stats["checked"] += 1
+        summary = summarize_article(
+            title=item["title"],
+            description=item["description"],
+        )
+
+        if summary:
+            update_article_summary(item["id"], summary)
+            record_summary_usage("auto", item["id"])
+            stats["summarized"] += 1
+        else:
+            stats["failed"] += 1
+            if _LAST_SUMMARY_ERROR == "quota":
+                stats["external_quota_exhausted"] = True
+                break
+
+    return stats
+
 # =========================================================
 # 6. 화면용 조회
 # =========================================================
@@ -3322,7 +3522,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3.2",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2.1",
         page_icon="📰",
         layout="wide",
     )
