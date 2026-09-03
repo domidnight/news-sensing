@@ -29,9 +29,10 @@ def main():
     quota = get_summary_quota_status()
 
     direct = news_stats.get("direct", {})
+    native = news_stats.get("native", {})
 
     print(
-        "=== GPA V3 HYBRID NEWS + SOCIAL COLLECTOR COMPLETE ==="
+        "=== GPA V3.2 KEYWORD-FIRST HYBRID COLLECTOR COMPLETE ==="
     )
     print(
         f"Direct sources enabled : "
@@ -66,6 +67,30 @@ def main():
         f"{direct.get('source_failures', 0)}"
     )
     print(
+        f"Native search pages     : "
+        f"{native.get('search_pages_checked', 0)}"
+    )
+    print(
+        f"Native search failures  : "
+        f"{native.get('search_page_failures', 0)}"
+    )
+    print(
+        f"Native candidate URLs   : "
+        f"{native.get('candidate_urls', 0)}"
+    )
+    print(
+        f"Native page failures    : "
+        f"{native.get('article_page_failures', 0)}"
+    )
+    print(
+        f"Native fallback saved   : "
+        f"{native.get('fallback_saved', 0)}"
+    )
+    print(
+        f"Native new articles     : "
+        f"{native.get('new_articles', 0)}"
+    )
+    print(
         f"Google feeds checked    : "
         f"{news_stats['feeds_checked']}"
     )
@@ -76,9 +101,6 @@ def main():
     print(
         f"Google new articles     : "
         f"{news_stats.get('google_new_articles', 0)}"
-    )
-    print(
-        "Google source rejected  : 0 (SAFE mode: 기존 Google 결과 유지)"
     )
     print(
         f"Total new articles      : "

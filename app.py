@@ -227,6 +227,59 @@ COMMON_SITEMAP_PATHS = [
     "/sitemap-news.xml",
 ]
 
+
+# V3.2: 각 사이트 자체 검색페이지를 키워드 단위로 보조 사용
+NATIVE_SEARCH_TEMPLATES = {
+    "reuters.com": {
+        "label": "Reuters",
+        "url": "https://www.reuters.com/site-search/?query={query}",
+    },
+    "wsj.com": {
+        "label": "The Wall Street Journal",
+        "url": "https://www.wsj.com/search?query={query}",
+    },
+    "ft.com": {
+        "label": "Financial Times",
+        "url": "https://www.ft.com/search?q={query}",
+    },
+    "bloomberg.com": {
+        "label": "Bloomberg",
+        "url": "https://www.bloomberg.com/search?query={query}",
+    },
+    "politico.com": {
+        "label": "POLITICO",
+        "url": "https://www.politico.com/search?q={query}",
+    },
+    "washingtonpost.com": {
+        "label": "The Washington Post",
+        "url": "https://www.washingtonpost.com/search/?query={query}",
+    },
+    "axios.com": {
+        "label": "Axios",
+        "url": "https://www.axios.com/search?q={query}",
+    },
+    "whitehouse.gov": {
+        "label": "The White House",
+        "url": "https://www.whitehouse.gov/news/?s={query}",
+    },
+    "state.gov": {
+        "label": "U.S. Department of State",
+        # State.gov 원문이 자동수집 서버에 403을 줄 때를 대비해
+        # State Department의 Search.gov 검색 경로를 사용
+        "url": (
+            "https://findit.state.gov/search?"
+            "query={query}&affiliate=dos_stategov&search="
+        ),
+    },
+}
+
+NATIVE_SEARCH_RESULTS_PER_KEYWORD = int(
+    os.environ.get("NATIVE_SEARCH_RESULTS_PER_KEYWORD", "6")
+)
+NATIVE_SEARCH_MAX_ARTICLE_FETCHES = int(
+    os.environ.get("NATIVE_SEARCH_MAX_ARTICLE_FETCHES", "180")
+)
+
 # Gemini 무료 한도 보호: 자동 10회 + 수동 10회
 AUTO_SUMMARY_DAILY_LIMIT = int(os.environ.get("AUTO_SUMMARY_DAILY_LIMIT", "10"))
 MANUAL_SUMMARY_DAILY_LIMIT = int(os.environ.get("MANUAL_SUMMARY_DAILY_LIMIT", "10"))
@@ -1067,6 +1120,35 @@ def _parse_flexible_datetime(value) -> datetime | None:
     except Exception:
         pass
 
+    # September 3, 2026 / Sep 3, 2026
+    for fmt in (
+        "%B %d, %Y",
+        "%b %d, %Y",
+        "%B %d %Y",
+        "%b %d %Y",
+    ):
+        try:
+            match = re.search(
+                r"\b(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|"
+                r"May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|"
+                r"Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+"
+                r"\d{1,2},?\s+20\d{2}\b",
+                raw,
+                flags=re.IGNORECASE,
+            )
+            if match:
+                value = match.group(0)
+                if "," not in fmt:
+                    value = value.replace(",", "")
+                dt = datetime.strptime(value, fmt)
+                return dt.replace(
+                    hour=12,
+                    minute=0,
+                    tzinfo=timezone.utc,
+                )
+        except Exception:
+            pass
+
     # YYYY-MM-DD
     match = re.search(r"\b(20\d{2})-(\d{2})-(\d{2})\b", raw)
     if match:
@@ -1890,6 +1972,345 @@ def _extract_direct_article(url: str, domain: str, label: str) -> dict:
         }
 
 
+
+def _extract_native_search_candidates(
+    html: str,
+    search_url: str,
+    target_domain: str,
+) -> list[dict]:
+    """
+    사이트 자체 검색결과에서 실제 기사 링크 + 제목 + 주변 문맥/날짜를 추출.
+    State.gov는 검색페이지가 findit.state.gov에 있어도 최종 링크가
+    state.gov이면 후보로 인정합니다.
+    """
+    soup = BeautifulSoup(html or "", "html.parser")
+    candidates = []
+    seen = set()
+
+    for a in soup.find_all("a", href=True):
+        href = (a.get("href") or "").strip()
+        if not href:
+            continue
+
+        absolute = _canonicalize_url(
+            urllib.parse.urljoin(search_url, href)
+        )
+
+        if not _host_matches_domain(
+            _host_from_url(absolute),
+            target_domain,
+        ):
+            continue
+
+        if not _is_likely_article_url(
+            absolute,
+            target_domain,
+        ):
+            continue
+
+        if absolute in seen:
+            continue
+        seen.add(absolute)
+
+        title = re.sub(
+            r"\s+",
+            " ",
+            a.get_text(" ", strip=True),
+        ).strip()
+
+        parent = (
+            a.find_parent("article")
+            or a.find_parent("li")
+            or a.find_parent("div")
+            or a.parent
+        )
+        context = ""
+        if parent:
+            context = re.sub(
+                r"\s+",
+                " ",
+                parent.get_text(" ", strip=True),
+            ).strip()
+
+        if not title and context:
+            title = context[:220]
+
+        candidates.append(
+            {
+                "url": absolute,
+                "title": title,
+                "context": context[:1800],
+                "published_at": _parse_flexible_datetime(
+                    context
+                ),
+            }
+        )
+
+        if len(candidates) >= NATIVE_SEARCH_RESULTS_PER_KEYWORD:
+            break
+
+    return candidates
+
+
+def collect_native_keyword_searches(
+    keyword_map: dict[str, list[str]],
+    enabled_domains: list[str],
+) -> dict:
+    """
+    V3.2 핵심 보완:
+    등록된 키워드를 각 사이트 자체 검색페이지에 직접 넣습니다.
+
+    장점:
+    - Reuters의 특정 기사처럼 최신 listing 첫 화면에서 빠진 기사도 검색 가능
+    - White House는 자체 검색으로 Releases/News를 직접 찾음
+    - State.gov 원문 403이어도 Search.gov 결과에서 링크/제목을 발견하면
+      fallback으로 DB에 저장 가능
+    """
+    enabled = []
+    seen_domains = set()
+
+    for raw in enabled_domains:
+        domain = normalize_domain(raw).split("/")[0]
+        if (
+            domain in NATIVE_SEARCH_TEMPLATES
+            and domain not in seen_domains
+        ):
+            enabled.append(domain)
+            seen_domains.add(domain)
+
+    stats = {
+        "search_pages_checked": 0,
+        "search_page_failures": 0,
+        "candidate_urls": 0,
+        "article_pages_checked": 0,
+        "article_page_failures": 0,
+        "fallback_saved": 0,
+        "matched_articles": 0,
+        "new_articles": 0,
+    }
+
+    if not enabled:
+        return stats
+
+    search_jobs = []
+
+    for category_name in NEWS_CATEGORY_NAMES:
+        for keyword in keyword_map.get(category_name, []):
+            for domain in enabled:
+                profile = NATIVE_SEARCH_TEMPLATES[domain]
+                query = urllib.parse.quote_plus(keyword)
+                search_url = profile["url"].format(query=query)
+
+                search_jobs.append(
+                    {
+                        "category": category_name,
+                        "keyword": keyword,
+                        "domain": domain,
+                        "label": profile["label"],
+                        "url": search_url,
+                    }
+                )
+
+    candidate_map = {}
+
+    workers = max(
+        1,
+        min(DIRECT_MAX_WORKERS, len(search_jobs)),
+    )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        future_map = {
+            executor.submit(_safe_get, job["url"]): job
+            for job in search_jobs
+        }
+
+        for future in as_completed(future_map):
+            job = future_map[future]
+
+            try:
+                response = future.result()
+                if response.status_code >= 400:
+                    stats["search_page_failures"] += 1
+                    continue
+
+                stats["search_pages_checked"] += 1
+
+                candidates = _extract_native_search_candidates(
+                    response.text,
+                    response.url or job["url"],
+                    job["domain"],
+                )
+
+                for candidate in candidates:
+                    # 검색결과 자체에도 키워드가 있어야 후보 유지
+                    search_text = (
+                        f"{candidate['title']} "
+                        f"{candidate['context']}"
+                    )
+                    if not exact_phrase_match(
+                        job["keyword"],
+                        search_text,
+                    ):
+                        continue
+
+                    url = candidate["url"]
+                    item = candidate_map.setdefault(
+                        url,
+                        {
+                            "url": url,
+                            "domain": job["domain"],
+                            "label": job["label"],
+                            "published_at": candidate[
+                                "published_at"
+                            ],
+                            "title": candidate["title"],
+                            "context": candidate["context"],
+                            "matches": [],
+                        },
+                    )
+
+                    item["matches"].append(
+                        (
+                            job["category"],
+                            job["keyword"],
+                        )
+                    )
+
+                    if (
+                        not item["published_at"]
+                        and candidate["published_at"]
+                    ):
+                        item["published_at"] = candidate[
+                            "published_at"
+                        ]
+
+                    if (
+                        len(candidate["context"])
+                        > len(item["context"])
+                    ):
+                        item["context"] = candidate[
+                            "context"
+                        ]
+
+            except Exception as exc:
+                print(
+                    f"[Native search error] "
+                    f"{job['domain']}: {exc}"
+                )
+                stats["search_page_failures"] += 1
+
+    candidates = list(candidate_map.values())[
+        :NATIVE_SEARCH_MAX_ARTICLE_FETCHES
+    ]
+    stats["candidate_urls"] = len(candidates)
+
+    if not candidates:
+        return stats
+
+    new_ids = set()
+
+    with ThreadPoolExecutor(
+        max_workers=min(
+            DIRECT_MAX_WORKERS,
+            len(candidates),
+        )
+    ) as executor:
+        future_map = {
+            executor.submit(
+                _extract_direct_article,
+                item["url"],
+                item["domain"],
+                item["label"],
+            ): item
+            for item in candidates
+        }
+
+        for future in as_completed(future_map):
+            item = future_map[future]
+
+            try:
+                article_data = future.result()
+            except Exception as exc:
+                article_data = {
+                    "error": str(exc)
+                }
+
+            page_ok = not (
+                article_data.get("error")
+                or article_data.get("skip")
+            )
+
+            if page_ok:
+                stats["article_pages_checked"] += 1
+                final_title = article_data["title"]
+                final_url = article_data["url"]
+                final_description = article_data[
+                    "description"
+                ]
+                final_published = (
+                    article_data["published_at"]
+                    or item["published_at"]
+                )
+                search_text = article_data[
+                    "search_text"
+                ]
+            else:
+                # State.gov 등 자동접근 403 시 검색결과 정보로 fallback
+                stats["article_page_failures"] += 1
+                final_title = (
+                    item["title"]
+                    or "(제목 정보 없음)"
+                )
+                final_url = item["url"]
+                final_description = item["context"]
+                final_published = item["published_at"]
+
+                # 발행시간을 못 얻어도 DB에서 사라지지 않도록
+                # detected_at 기준 fallback을 화면 필터에서 사용합니다.
+                search_text = (
+                    f"{final_title} "
+                    f"{final_description}"
+                )
+
+            for category_name, keyword in item["matches"]:
+                if not exact_phrase_match(
+                    keyword,
+                    search_text,
+                ):
+                    continue
+
+                stats["matched_articles"] += 1
+
+                try:
+                    article_id, is_new, _ = upsert_article(
+                        category_name=category_name,
+                        title=final_title,
+                        link=final_url,
+                        source=item["label"],
+                        published_at=final_published,
+                        description=final_description,
+                        matched_keywords=[keyword],
+                    )
+
+                    if not page_ok:
+                        stats["fallback_saved"] += 1
+
+                    if (
+                        is_new
+                        and article_id
+                        and article_id not in new_ids
+                    ):
+                        new_ids.add(article_id)
+                        stats["new_articles"] += 1
+
+                except Exception as exc:
+                    print(
+                        f"[Native search save error] "
+                        f"{item['domain']}: {exc}"
+                    )
+
+    return stats
+
 def collect_direct_sources(
     keyword_map: dict[str, list[str]],
     enabled_domains: list[str],
@@ -2329,11 +2750,12 @@ def _fetch_feed_job(job: dict) -> dict:
 
 def collect_all_categories(generate_summaries: bool = True) -> dict:
     """
-    generate_summaries=False:
-        웹사이트 수동 버튼용. RSS만 빠르게 병렬 수집하고 요약은 기다리지 않습니다.
+    V3.2 Keyword-First Hybrid
 
-    generate_summaries=True:
-        자동 collector용. RSS 수집 후 요약이 없는 기사까지 Gemini로 처리합니다.
+    1) 기존 latest/sitemap 직접 센싱
+    2) 각 사이트 자체 검색페이지에 키워드 직접 검색
+    3) Google News도 키워드 1개씩 검색
+       (기존 4개 OR 묶음 제거 → 희귀 키워드가 묻히는 문제 완화)
     """
     keyword_map, domains = get_settings()
 
@@ -2342,97 +2764,132 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         "matched_articles": 0,
         "new_articles": 0,
         "google_new_articles": 0,
-        "google_source_rejected": 0,
         "summaries_created": 0,
         "errors": 0,
         "direct": {},
+        "native": {},
     }
 
-    # V3: 직접 센싱을 먼저 수행해 원문 URL/본문을 우선 확보.
-    # 직접 접근이 막혀도 아래 Google News RSS가 계속 보조망 역할을 합니다.
+    # 1. 최신 페이지 / sitemap 기반 직접 센싱
     direct_stats = collect_direct_sources(
         keyword_map=keyword_map,
         enabled_domains=domains,
     )
     stats["direct"] = direct_stats
-    stats["new_articles"] += direct_stats[
-        "new_articles"
+    stats["new_articles"] += direct_stats["new_articles"]
+
+    # 2. 사이트 자체 검색페이지 기반 키워드 센싱
+    native_stats = collect_native_keyword_searches(
+        keyword_map=keyword_map,
+        enabled_domains=domains,
+    )
+    stats["native"] = native_stats
+    stats["new_articles"] += native_stats["new_articles"]
+
+    # 3. Google News: 키워드 1개씩 + 여러 도메인을 묶어서 검색
+    # 키워드 OR 묶음을 없애서 Foundry School 같은 희귀 키워드가
+    # OpenAI/Texas 같은 넓은 키워드 결과에 밀리지 않게 합니다.
+    clean_domains = []
+    seen_domains = set()
+
+    for raw in domains:
+        value = normalize_domain(raw)
+        if value and value not in seen_domains:
+            seen_domains.add(value)
+            clean_domains.append(value)
+
+    domain_chunk_size = 6
+    domain_chunks = [
+        clean_domains[i:i + domain_chunk_size]
+        for i in range(
+            0,
+            len(clean_domains),
+            domain_chunk_size,
+        )
     ]
 
-    chunk_size = 4
     jobs = []
 
     for category_name in NEWS_CATEGORY_NAMES:
-        category_keywords = keyword_map.get(category_name, [])
-        if not category_keywords:
-            continue
+        for keyword in keyword_map.get(category_name, []):
+            kw_query = google_keyword_query(keyword)
+            if not kw_query:
+                continue
 
-        chunks = [
-            category_keywords[i:i + chunk_size]
-            for i in range(0, len(category_keywords), chunk_size)
-        ]
-
-        for domain in domains:
-            for chunk in chunks:
-                query_parts = [
-                    google_keyword_query(kw)
-                    for kw in chunk
-                ]
-                query_parts = [
-                    part for part in query_parts if part
-                ]
-                if not query_parts:
-                    continue
-
-                kw_query = " OR ".join(
-                    f"({part})" for part in query_parts
+            for domain_chunk in domain_chunks:
+                site_query = " OR ".join(
+                    f"site:{domain}"
+                    for domain in domain_chunk
                 )
+
                 full_query = (
-                    f"({kw_query}) site:{domain} "
+                    f"({kw_query}) "
+                    f"({site_query}) "
                     f"when:{SEARCH_LOOKBACK_HOURS}h"
                 )
-                encoded_query = urllib.parse.quote(full_query)
+
+                encoded_query = urllib.parse.quote(
+                    full_query
+                )
                 rss_url = (
                     "https://news.google.com/rss/search"
-                    f"?q={encoded_query}&hl=en-US&gl=US&ceid=US:en"
+                    f"?q={encoded_query}"
+                    "&hl=en-US&gl=US&ceid=US:en"
                 )
+
                 jobs.append(
                     {
                         "category_name": category_name,
-                        "category_keywords": category_keywords,
-                        "domain": domain,
+                        "keyword": keyword,
+                        "domain": ",".join(domain_chunk),
                         "rss_url": rss_url,
                     }
                 )
 
     feed_results = []
+
     if jobs:
-        workers = max(1, min(RSS_MAX_WORKERS, len(jobs)))
-        with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = [executor.submit(_fetch_feed_job, job) for job in jobs]
+        workers = max(
+            1,
+            min(RSS_MAX_WORKERS, len(jobs)),
+        )
+
+        with ThreadPoolExecutor(
+            max_workers=workers
+        ) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_feed_job,
+                    job,
+                )
+                for job in jobs
+            ]
+
             for future in as_completed(futures):
                 result = future.result()
                 feed_results.append(result)
                 stats["feeds_checked"] += 1
+
                 if result["error"]:
-                    print(f"[Feed error] {result['domain']}: {result['error']}")
+                    print(
+                        f"[Feed error] "
+                        f"{result['domain']}: "
+                        f"{result['error']}"
+                    )
                     stats["errors"] += 1
 
     seen_links_by_category = {
-        category_name: set() for category_name in NEWS_CATEGORY_NAMES
+        category_name: set()
+        for category_name in NEWS_CATEGORY_NAMES
     }
     summary_queue = {}
 
     for result in feed_results:
         category_name = result["category_name"]
-        category_keywords = result["category_keywords"]
+        keyword = result["keyword"]
 
         for entry in result["entries"]:
             source = get_feed_source(entry)
-
-            # V3.1 SAFE:
-            # Google News 결과는 V2.x와 동일하게 그대로 유지합니다.
-            # 직접 센싱은 기존 결과를 대체하거나 줄이지 않고 추가만 합니다.
             raw_title = str(
                 entry.get("title", "") or ""
             )
@@ -2447,27 +2904,29 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
                 entry.get("link", "") or ""
             )
 
-            if (
-                not link
-                or link
-                in seen_links_by_category[
-                    category_name
-                ]
-            ):
+            if not link:
+                continue
+
+            # 같은 카테고리에서 동일 URL은 한 번만 처리
+            if link in seen_links_by_category[
+                category_name
+            ]:
                 continue
 
             text_to_search = (
                 f"{title} {description_raw}"
             )
-            matched_keywords = [
-                kw for kw in category_keywords
-                if exact_phrase_match(kw, text_to_search)
-            ]
 
-            if not matched_keywords:
+            if not exact_phrase_match(
+                keyword,
+                text_to_search,
+            ):
                 continue
 
-            seen_links_by_category[category_name].add(link)
+            seen_links_by_category[
+                category_name
+            ].add(link)
+
             stats["matched_articles"] += 1
 
             published_at = parse_published(
@@ -2477,277 +2936,58 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
                 )
             )
             clean_description = BeautifulSoup(
-                description_raw, "html.parser"
+                description_raw,
+                "html.parser",
             ).get_text(" ", strip=True)
 
             try:
-                article_id, is_new, needs_summary = upsert_article(
-                    category_name=category_name,
-                    title=title,
-                    link=link,
-                    source=source,
-                    published_at=published_at,
-                    description=clean_description,
-                    matched_keywords=matched_keywords,
+                article_id, is_new, needs_summary = (
+                    upsert_article(
+                        category_name=category_name,
+                        title=title,
+                        link=link,
+                        source=source,
+                        published_at=published_at,
+                        description=clean_description,
+                        matched_keywords=[keyword],
+                    )
                 )
 
                 if is_new:
                     stats["new_articles"] += 1
                     stats["google_new_articles"] += 1
 
-                if article_id and needs_summary and generate_summaries:
-                    summary_queue[article_id] = (title, clean_description)
+                if (
+                    article_id
+                    and needs_summary
+                    and generate_summaries
+                ):
+                    summary_queue[article_id] = (
+                        title,
+                        clean_description,
+                    )
 
             except Exception as exc:
-                print(f"[Article save error] {exc}")
+                print(
+                    f"[Article save error] {exc}"
+                )
                 stats["errors"] += 1
 
-    stats["auto_quota_exhausted"] = False
-
     if generate_summaries:
-        remaining_auto = remaining_summary_quota("auto")
-
-        for article_id, (title, clean_description) in summary_queue.items():
-            if remaining_auto <= 0:
-                break
-
+        for article_id, (
+            title,
+            clean_description,
+        ) in summary_queue.items():
             summary = summarize_article(
                 title=title,
                 description=clean_description,
             )
             if summary:
-                update_article_summary(article_id, summary)
-                record_summary_usage("auto", article_id)
-                stats["summaries_created"] += 1
-                remaining_auto -= 1
-            elif _LAST_SUMMARY_ERROR == "quota":
-                stats["auto_quota_exhausted"] = True
-                break
-
-    return stats
-
-
-def _parse_x_created_at(raw_value: str) -> datetime | None:
-    """X syndication의 created_at 문자열을 UTC datetime으로 변환."""
-    raw_value = str(raw_value or "").strip()
-    if not raw_value:
-        return None
-
-    try:
-        dt = datetime.strptime(
-            raw_value,
-            "%a %b %d %H:%M:%S %z %Y",
-        )
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        pass
-
-    try:
-        dt = datetime.fromisoformat(raw_value.replace("Z", "+00:00"))
-        if dt.tzinfo is None:
-            dt = dt.replace(tzinfo=timezone.utc)
-        return dt.astimezone(timezone.utc)
-    except Exception:
-        return None
-
-
-def _fetch_x_profile_timeline(handle: str) -> list[dict]:
-    """
-    X의 공개 임베드 타임라인(syndication)에서 공개 프로필 게시물을 가져옵니다.
-    API Key가 필요 없는 무료 경로지만 X가 내부 구조를 바꾸면 동작이 깨질 수 있습니다.
-    """
-    url = (
-        "https://syndication.twitter.com/srv/"
-        f"timeline-profile/screen-name/{handle}"
-    )
-
-    response = requests.get(
-        url,
-        timeout=RSS_TIMEOUT_SECONDS,
-        headers={
-            "User-Agent": (
-                "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                "AppleWebKit/537.36 Chrome/124 Safari/537.36"
-            )
-        },
-    )
-    response.raise_for_status()
-
-    soup = BeautifulSoup(response.text, "html.parser")
-    script = soup.find("script", id="__NEXT_DATA__")
-    if not script:
-        raise ValueError("X 공개 타임라인 데이터(__NEXT_DATA__)를 찾지 못했습니다.")
-
-    raw_json = script.string or script.get_text()
-    data = json.loads(raw_json)
-
-    page_props = data.get("props", {}).get("pageProps", {})
-    entries = page_props.get("timeline", {}).get("entries", [])
-
-    posts = []
-
-    for entry in entries:
-        if not isinstance(entry, dict):
-            continue
-
-        content = entry.get("content") or {}
-        tweet = content.get("tweet") if isinstance(content, dict) else None
-        if not isinstance(tweet, dict):
-            continue
-
-        tweet_id = str(tweet.get("id_str") or tweet.get("id") or "").strip()
-        full_text = str(
-            tweet.get("full_text")
-            or tweet.get("text")
-            or ""
-        ).strip()
-
-        if not tweet_id or not full_text:
-            continue
-
-        user = tweet.get("user") or {}
-        author_handle = str(
-            user.get("screen_name") or handle
-        ).strip()
-        author_name = str(
-            user.get("name") or author_handle
-        ).strip()
-
-        permalink = str(tweet.get("permalink") or "").strip()
-        if permalink.startswith("/"):
-            permalink = "https://x.com" + permalink
-        elif not permalink.startswith("http"):
-            permalink = f"https://x.com/{author_handle}/status/{tweet_id}"
-
-        posts.append(
-            {
-                "id": tweet_id,
-                "text": full_text,
-                "link": permalink,
-                "published_at": _parse_x_created_at(
-                    tweet.get("created_at", "")
-                ),
-                "author_handle": author_handle,
-                "author_name": author_name,
-            }
-        )
-
-    return posts
-
-
-def collect_social_posts() -> dict:
-    """
-    Helberg/Bessent 공개 X 계정을 무료 best-effort 방식으로 센싱합니다.
-    새 게시물은 기존 articles/article_matches 테이블에 함께 저장됩니다.
-    """
-    stats = {
-        "profiles_checked": 0,
-        "matched_posts": 0,
-        "new_posts": 0,
-        "errors": 0,
-    }
-
-    for category_name, accounts in SOCIAL_ACCOUNTS.items():
-        for account in accounts:
-            handle = account["handle"]
-            label = account["label"]
-
-            try:
-                posts = _fetch_x_profile_timeline(handle)
-                stats["profiles_checked"] += 1
-            except Exception as exc:
-                print(f"[Social feed error] @{handle}: {exc}")
-                stats["errors"] += 1
-                continue
-
-            for post in posts:
-                stats["matched_posts"] += 1
-
-                # 제목은 목록 가독성을 위해 짧게, 원문은 description에 전체 저장
-                one_line = re.sub(r"\s+", " ", post["text"]).strip()
-                title = (
-                    one_line[:150] + "…"
-                    if len(one_line) > 150
-                    else one_line
+                update_article_summary(
+                    article_id,
+                    summary,
                 )
-
-                try:
-                    _, is_new, _ = upsert_article(
-                        category_name=category_name,
-                        title=title,
-                        link=post["link"],
-                        source=f"X · @{handle}",
-                        published_at=post["published_at"],
-                        description=post["text"],
-                        matched_keywords=[f"@{handle}"],
-                    )
-
-                    if is_new:
-                        stats["new_posts"] += 1
-
-                except Exception as exc:
-                    print(f"[Social save error] @{handle}: {exc}")
-                    stats["errors"] += 1
-
-    return stats
-
-
-def summarize_pending_articles(limit: int = 10) -> dict:
-    """
-    가장 최근의 미요약 콘텐츠를 우선 자동 요약하되,
-    하루 AUTO_SUMMARY_DAILY_LIMIT(기본 10회)을 절대 넘지 않습니다.
-    """
-    stats = {
-        "checked": 0,
-        "summarized": 0,
-        "failed": 0,
-        "skipped_by_daily_limit": 0,
-        "external_quota_exhausted": False,
-    }
-
-    remaining_auto = remaining_summary_quota("auto")
-    allowed = min(limit, remaining_auto)
-
-    if allowed <= 0:
-        stats["skipped_by_daily_limit"] = limit
-        return stats
-
-    with SessionLocal() as session:
-        pending = session.scalars(
-            select(Article)
-            .where(Article.summary.is_(None))
-            .order_by(Article.detected_at.desc())
-            .limit(allowed)
-        ).all()
-
-        items = [
-            {
-                "id": article.id,
-                "title": article.title,
-                "description": article.description,
-            }
-            for article in pending
-        ]
-
-    for item in items:
-        if remaining_summary_quota("auto") <= 0:
-            break
-
-        stats["checked"] += 1
-        summary = summarize_article(
-            title=item["title"],
-            description=item["description"],
-        )
-
-        if summary:
-            update_article_summary(item["id"], summary)
-            record_summary_usage("auto", item["id"])
-            stats["summarized"] += 1
-        else:
-            stats["failed"] += 1
-            if _LAST_SUMMARY_ERROR == "quota":
-                stats["external_quota_exhausted"] = True
-                break
+                stats["summaries_created"] += 1
 
     return stats
 
@@ -2781,10 +3021,15 @@ def get_category_articles(
             cutoff = datetime.now(timezone.utc) - timedelta(hours=period_hours)
 
             if time_basis == "published":
-                # 기사 발행/소셜 게시 시각 기준. 발행 시각이 없는 항목은 제외됩니다.
+                # V3.2:
+                # State.gov 같은 일부 출처가 자동접근을 막아 발행시각을
+                # 추출하지 못한 경우 detected_at을 fallback으로 사용합니다.
+                effective_time = func.coalesce(
+                    Article.published_at,
+                    Article.detected_at,
+                )
                 stmt = stmt.where(
-                    Article.published_at.is_not(None),
-                    Article.published_at >= cutoff,
+                    effective_time >= cutoff
                 )
             else:
                 # 기존 기본값: 우리 시스템이 처음 발견한 시각 기준
@@ -2792,8 +3037,12 @@ def get_category_articles(
 
         # 선택한 시간 기준에 맞춰 최신순 정렬
         if time_basis == "published":
+            effective_time = func.coalesce(
+                Article.published_at,
+                Article.detected_at,
+            )
             stmt = stmt.order_by(
-                Article.published_at.desc().nullslast(),
+                effective_time.desc(),
                 Article.detected_at.desc(),
             )
         else:
@@ -3073,7 +3322,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2",
         page_icon="📰",
         layout="wide",
     )
@@ -3082,7 +3331,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "Hybrid Collector SAFE: 기존 Google News 유지 + 지정 매체 직접 센싱 추가 / "
+        "Keyword-First Hybrid: 키워드별 Google News + 사이트 자체검색 + 직접 센싱 / "
         "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
         "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
@@ -3102,10 +3351,12 @@ def main():
                 social_stats = collect_social_posts()
 
             direct = stats.get("direct", {})
+            native = stats.get("native", {})
 
             st.success(
                 f"Hybrid 수집 완료: 신규 기사 {stats['new_articles']}개 "
-                f"(직접 {direct.get('new_articles', 0)} / "
+                f"(최신페이지 {direct.get('new_articles', 0)} / "
+                f"사이트검색 {native.get('new_articles', 0)} / "
                 f"Google {stats.get('google_new_articles', 0)}) · "
                 f"신규 소셜 {social_stats['new_posts']}개"
             )
