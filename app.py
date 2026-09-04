@@ -272,15 +272,6 @@ NATIVE_SEARCH_TEMPLATES = {
         "label": "The White House",
         "url": "https://www.whitehouse.gov/news/?s={query}",
     },
-    "state.gov": {
-        "label": "U.S. Department of State",
-        # State.gov 원문이 자동수집 서버에 403을 줄 때를 대비해
-        # State Department의 Search.gov 검색 경로를 사용
-        "url": (
-            "https://findit.state.gov/search?"
-            "query={query}&affiliate=dos_stategov&search="
-        ),
-    },
 }
 
 NATIVE_SEARCH_RESULTS_PER_KEYWORD = int(
@@ -288,6 +279,16 @@ NATIVE_SEARCH_RESULTS_PER_KEYWORD = int(
 )
 NATIVE_SEARCH_MAX_ARTICLE_FETCHES = int(
     os.environ.get("NATIVE_SEARCH_MAX_ARTICLE_FETCHES", "180")
+)
+
+
+# V3.2.3: State.gov 전용 Press Release 수집
+STATE_WP_API_ENDPOINTS = [
+    "https://www.state.gov/wp-json/wp/v2/pages",
+    "https://www.state.gov/wp-json/wp/v2/posts",
+]
+STATE_API_PER_PAGE = int(
+    os.environ.get("STATE_API_PER_PAGE", "50")
 )
 
 # Gemini 무료 한도 보호: 자동 10회 + 수동 10회
@@ -2119,6 +2120,216 @@ def _extract_native_search_candidates(
     return candidates
 
 
+
+def _state_release_url_allowed(url: str) -> bool:
+    try:
+        parsed = urllib.parse.urlparse(url or "")
+        host = (parsed.netloc or "").lower()
+        if host.startswith("www."):
+            host = host[4:]
+
+        return (
+            host == "state.gov"
+            and (parsed.path or "/").startswith("/releases/")
+        )
+    except Exception:
+        return False
+
+
+def _state_api_text(value) -> str:
+    if isinstance(value, dict):
+        value = value.get("rendered", "")
+    return BeautifulSoup(
+        str(value or ""),
+        "html.parser",
+    ).get_text(" ", strip=True)
+
+
+def collect_state_press_releases_api(
+    keyword_map: dict[str, list[str]],
+    enabled_domains: list[str],
+) -> dict:
+    """
+    State.gov 전용 Press Release 센싱.
+    WordPress REST API에서 키워드 검색 후 실제 /releases/ URL만 저장.
+    """
+    enabled = any(
+        normalize_domain(raw).split("/")[0] == "state.gov"
+        for raw in enabled_domains
+    )
+
+    stats = {
+        "api_requests": 0,
+        "api_failures": 0,
+        "api_results": 0,
+        "release_candidates": 0,
+        "matched_articles": 0,
+        "new_articles": 0,
+    }
+
+    if not enabled:
+        return stats
+
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=DIRECT_LOOKBACK_HOURS)
+    )
+    after_value = cutoff.isoformat().replace("+00:00", "Z")
+
+    jobs = []
+    for category_name in NEWS_CATEGORY_NAMES:
+        for keyword in keyword_map.get(category_name, []):
+            for endpoint in STATE_WP_API_ENDPOINTS:
+                jobs.append(
+                    {
+                        "category": category_name,
+                        "keyword": keyword,
+                        "endpoint": endpoint,
+                    }
+                )
+
+    if not jobs:
+        return stats
+
+    def fetch_state_job(job):
+        try:
+            response = requests.get(
+                job["endpoint"],
+                params={
+                    "search": job["keyword"],
+                    "per_page": STATE_API_PER_PAGE,
+                    "after": after_value,
+                    "orderby": "date",
+                    "order": "desc",
+                },
+                timeout=DIRECT_TIMEOUT_SECONDS,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) "
+                        "Chrome/124.0 Safari/537.36 "
+                        "GPA-News-Sensing/3.2.3"
+                    ),
+                    "Accept": "application/json,text/plain,*/*",
+                    "Accept-Language": "en-US,en;q=0.9",
+                },
+            )
+            response.raise_for_status()
+            data = response.json()
+            if not isinstance(data, list):
+                data = []
+            return {**job, "items": data, "error": None}
+        except Exception as exc:
+            return {**job, "items": [], "error": str(exc)}
+
+    results = []
+    workers = max(
+        1,
+        min(DIRECT_MAX_WORKERS, len(jobs)),
+    )
+
+    with ThreadPoolExecutor(max_workers=workers) as executor:
+        futures = [
+            executor.submit(fetch_state_job, job)
+            for job in jobs
+        ]
+
+        for future in as_completed(futures):
+            result = future.result()
+            stats["api_requests"] += 1
+
+            if result["error"]:
+                stats["api_failures"] += 1
+                continue
+
+            stats["api_results"] += len(result["items"])
+            results.append(result)
+
+    seen = set()
+    new_ids = set()
+
+    for result in results:
+        category_name = result["category"]
+        keyword = result["keyword"]
+
+        for item in result["items"]:
+            link = _canonicalize_url(
+                str(item.get("link") or "")
+            )
+
+            # State 전체가 아니라 Press Release 원문만
+            if not _state_release_url_allowed(link):
+                continue
+
+            dedupe_key = (
+                category_name,
+                keyword.lower(),
+                link,
+            )
+            if dedupe_key in seen:
+                continue
+            seen.add(dedupe_key)
+
+            stats["release_candidates"] += 1
+
+            title = _state_api_text(item.get("title"))
+            excerpt = _state_api_text(item.get("excerpt"))
+            content = _state_api_text(item.get("content"))
+
+            search_text = "\n".join(
+                value
+                for value in (title, excerpt, content)
+                if value
+            )
+
+            if not exact_phrase_match(
+                keyword,
+                search_text,
+            ):
+                continue
+
+            stats["matched_articles"] += 1
+
+            published_at = (
+                _parse_flexible_datetime(item.get("date_gmt"))
+                or _parse_flexible_datetime(item.get("date"))
+            )
+
+            description = excerpt or content[:3000]
+
+            try:
+                article_id, is_new, _ = upsert_article(
+                    category_name=category_name,
+                    title=title,
+                    link=link,
+                    source="U.S. Department of State",
+                    published_at=published_at,
+                    description=description,
+                    matched_keywords=[keyword],
+                )
+
+                if (
+                    is_new
+                    and article_id
+                    and article_id not in new_ids
+                ):
+                    new_ids.add(article_id)
+                    stats["new_articles"] += 1
+
+            except Exception as exc:
+                print(f"[State API save error] {exc}")
+
+    print(
+        "[State Press API] "
+        f"requests={stats['api_requests']} "
+        f"failures={stats['api_failures']} "
+        f"release_candidates={stats['release_candidates']} "
+        f"matched={stats['matched_articles']} "
+        f"new={stats['new_articles']}"
+    )
+
+    return stats
+
 def collect_native_keyword_searches(
     keyword_map: dict[str, list[str]],
     enabled_domains: list[str],
@@ -2139,7 +2350,8 @@ def collect_native_keyword_searches(
     for raw in enabled_domains:
         domain = normalize_domain(raw).split("/")[0]
         if (
-            domain in NATIVE_SEARCH_TEMPLATES
+            domain != "state.gov"
+            and domain in NATIVE_SEARCH_TEMPLATES
             and domain not in seen_domains
         ):
             enabled.append(domain)
@@ -2167,12 +2379,6 @@ def collect_native_keyword_searches(
                 profile = NATIVE_SEARCH_TEMPLATES[domain]
 
                 search_term = keyword
-                if domain == "state.gov":
-                    # Search.gov가 State 전체 페이지를 반환하지 않도록
-                    # 실제 press release URL 경로로 검색 범위 제한
-                    search_term = (
-                        f'{keyword} site:state.gov/releases/'
-                    )
 
                 query = urllib.parse.quote_plus(
                     search_term
@@ -2858,19 +3064,34 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         "google_new_articles": 0,
         "summaries_created": 0,
         "errors": 0,
+        "state": {},
         "direct": {},
         "native": {},
     }
 
-    # 1. 최신 페이지 / sitemap 기반 직접 센싱
-    direct_stats = collect_direct_sources(
+    # 1. State.gov는 전용 API로 Press Release만 센싱
+    state_stats = collect_state_press_releases_api(
         keyword_map=keyword_map,
         enabled_domains=domains,
+    )
+    stats["state"] = state_stats
+    stats["new_articles"] += state_stats["new_articles"]
+
+    # 2. 나머지 출처 직접 센싱
+    direct_domains = [
+        raw
+        for raw in domains
+        if normalize_domain(raw).split("/")[0] != "state.gov"
+    ]
+
+    direct_stats = collect_direct_sources(
+        keyword_map=keyword_map,
+        enabled_domains=direct_domains,
     )
     stats["direct"] = direct_stats
     stats["new_articles"] += direct_stats["new_articles"]
 
-    # 2. 사이트 자체 검색페이지 기반 키워드 센싱
+    # 3. 사이트 자체 검색페이지 기반 키워드 센싱
     native_stats = collect_native_keyword_searches(
         keyword_map=keyword_map,
         enabled_domains=domains,
@@ -2878,7 +3099,7 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
     stats["native"] = native_stats
     stats["new_articles"] += native_stats["new_articles"]
 
-    # 3. Google News: 키워드 1개씩 + 여러 도메인을 묶어서 검색
+    # 4. Google News: 키워드 1개씩 + 여러 도메인을 묶어서 검색
     # 키워드 OR 묶음을 없애서 Foundry School 같은 희귀 키워드가
     # OpenAI/Texas 같은 넓은 키워드 결과에 밀리지 않게 합니다.
     clean_domains = []
@@ -3316,8 +3537,21 @@ def _article_in_allowed_government_scope(
     기존 데이터 보존을 위해 그대로 둡니다.
     """
     host = _host_from_url(link)
+    source_key = _source_key(source)
 
-    if host == "state.gov":
+    is_state_source = (
+        host == "state.gov"
+        or "department of state" in source_key
+        or source_key == "state department"
+        or "state gov" in source_key
+    )
+
+    if is_state_source:
+        # 과거 Google/Search 우회 주소도 포함해
+        # 실제 state.gov/releases 원문이 아니면 숨김
+        if host != "state.gov":
+            return False
+
         path = urllib.parse.urlparse(
             link
         ).path or "/"
@@ -3674,7 +3908,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3.2.2",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2.3",
         page_icon="📰",
         layout="wide",
     )
@@ -3683,7 +3917,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "Keyword-First Hybrid: 언론사 검색 + State Press Releases + White House News 전용 센싱 / "
+        "Keyword-First Hybrid: State Press API 전용 + White House News + 언론사 검색 / "
         "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
         "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
@@ -3702,12 +3936,14 @@ def main():
                 )
                 social_stats = collect_social_posts()
 
+            state_stats = stats.get("state", {})
             direct = stats.get("direct", {})
             native = stats.get("native", {})
 
             st.success(
                 f"Hybrid 수집 완료: 신규 기사 {stats['new_articles']}개 "
-                f"(최신페이지 {direct.get('new_articles', 0)} / "
+                f"(State Press {state_stats.get('new_articles', 0)} / "
+                f"최신페이지 {direct.get('new_articles', 0)} / "
                 f"사이트검색 {native.get('new_articles', 0)} / "
                 f"Google {stats.get('google_new_articles', 0)}) · "
                 f"신규 소셜 {social_stats['new_posts']}개"
