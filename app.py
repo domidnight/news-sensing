@@ -3646,6 +3646,32 @@ def get_category_articles(
                 .order_by(ArticleMatch.id)
             ).all()
 
+            # V3.2.7:
+            # State.gov는 화면 표시 시에도 "제목 매칭"을 다시 검증합니다.
+            # 과거 버전에서 본문 매칭으로 DB에 들어온 Public Schedule 같은
+            # 오래된 잡음을 DB 삭제 없이 즉시 숨깁니다.
+            state_source_key = _source_key(article.source)
+            is_state_article = (
+                _host_from_url(article.link) == "state.gov"
+                or "department of state" in state_source_key
+                or state_source_key == "state department"
+            )
+
+            if is_state_article:
+                title_matched_tags = [
+                    tag
+                    for tag in tags
+                    if exact_phrase_match(
+                        tag,
+                        article.title or "",
+                    )
+                ]
+
+                if not title_matched_tags:
+                    continue
+
+                tags = title_matched_tags
+
             result.append(
                 {
                     "id": article.id,
@@ -3901,7 +3927,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3.2.6",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2.7",
         page_icon="📰",
         layout="wide",
     )
