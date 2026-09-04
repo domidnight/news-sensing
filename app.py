@@ -2113,6 +2113,12 @@ def _extract_native_search_candidates(
 
 
 
+STATE_PRESS_RELEASE_INDEX_URL = (
+    "https://raw.githubusercontent.com/"
+    "markschaver/State-Department-PR/master/index.json"
+)
+
+
 def _state_release_url_allowed(url: str) -> bool:
     try:
         parsed = urllib.parse.urlparse(url or "")
@@ -2128,108 +2134,19 @@ def _state_release_url_allowed(url: str) -> bool:
         return False
 
 
-def _state_api_text(value) -> str:
-    if isinstance(value, dict):
-        value = value.get("rendered", "")
-    return BeautifulSoup(
-        str(value or ""),
-        "html.parser",
-    ).get_text(" ", strip=True)
-
-
-def _fetch_state_rest_detail(item: dict) -> dict:
-    """
-    WP global search result가 제공하는 REST self 링크를 따라가
-    title/excerpt/content/date를 최대한 확보.
-    실패해도 search 결과 자체는 fallback으로 사용.
-    """
-    self_url = ""
-
-    try:
-        links = item.get("_links") or {}
-        self_items = links.get("self") or []
-        if self_items and isinstance(self_items, list):
-            self_url = str(
-                self_items[0].get("href") or ""
-            ).strip()
-    except Exception:
-        self_url = ""
-
-    if not self_url:
-        return {
-            "ok": False,
-            "title": str(item.get("title") or ""),
-            "excerpt": "",
-            "content": "",
-            "published_at": None,
-        }
-
-    try:
-        response = requests.get(
-            self_url,
-            timeout=DIRECT_TIMEOUT_SECONDS,
-            headers={
-                "User-Agent": (
-                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                    "AppleWebKit/537.36 (KHTML, like Gecko) "
-                    "Chrome/124.0 Safari/537.36 "
-                    "GPA-News-Sensing/3.2.4"
-                ),
-                "Accept": "application/json,text/plain,*/*",
-                "Accept-Language": "en-US,en;q=0.9",
-            },
-        )
-        response.raise_for_status()
-        data = response.json()
-
-        title = _state_api_text(
-            data.get("title")
-        )
-        excerpt = _state_api_text(
-            data.get("excerpt")
-        )
-        content = _state_api_text(
-            data.get("content")
-        )
-        published_at = (
-            _parse_flexible_datetime(
-                data.get("date_gmt")
-            )
-            or _parse_flexible_datetime(
-                data.get("date")
-            )
-        )
-
-        return {
-            "ok": True,
-            "title": title,
-            "excerpt": excerpt,
-            "content": content,
-            "published_at": published_at,
-        }
-
-    except Exception:
-        return {
-            "ok": False,
-            "title": str(item.get("title") or ""),
-            "excerpt": "",
-            "content": "",
-            "published_at": None,
-        }
-
-
 def collect_state_press_releases_api(
     keyword_map: dict[str, list[str]],
     enabled_domains: list[str],
 ) -> dict:
     """
-    V3.2.4 State.gov Press Release 전용 센싱.
+    V3.2.6 State Department STRICT mode
 
-    핵심 변경:
-    - /pages, /posts를 직접 조회하지 않음
-    - /wp-json/wp/v2/search 에서 전체 public content type 검색
-    - 결과 URL이 반드시 state.gov/releases/... 인 항목만 허용
-    - REST self 링크가 있으면 상세 JSON을 다시 읽어 본문까지 키워드 검사
+    저장 조건은 딱 2개:
+    1) State Department Press Release 전용 피드에 있는 항목
+    2) 등록 키워드가 제목에 정확히 매칭되는 항목
+
+    본문 / summary / excerpt는 키워드 판정에 절대 사용하지 않습니다.
+    따라서 Public Schedule 본문에 키워드가 있어도 제목에 없으면 저장되지 않습니다.
     """
     enabled = any(
         normalize_domain(raw).split("/")[0] == "state.gov"
@@ -2237,12 +2154,11 @@ def collect_state_press_releases_api(
     )
 
     stats = {
-        "search_requests": 0,
-        "search_failures": 0,
-        "search_results": 0,
+        "feed_requests": 0,
+        "feed_failures": 0,
+        "feed_items": 0,
+        "recent_items": 0,
         "release_candidates": 0,
-        "detail_checked": 0,
-        "detail_failures": 0,
         "matched_articles": 0,
         "new_articles": 0,
     }
@@ -2250,178 +2166,120 @@ def collect_state_press_releases_api(
     if not enabled:
         return stats
 
-    search_endpoint = (
-        "https://www.state.gov/wp-json/wp/v2/search"
-    )
+    try:
+        response = requests.get(
+            STATE_PRESS_RELEASE_INDEX_URL,
+            timeout=DIRECT_TIMEOUT_SECONDS,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 (KHTML, like Gecko) "
+                    "Chrome/124.0 Safari/537.36 "
+                    "GPA-News-Sensing/3.2.6"
+                ),
+                "Accept": "application/json,text/plain,*/*",
+            },
+        )
+        stats["feed_requests"] += 1
+        response.raise_for_status()
 
-    jobs = []
-    for category_name in NEWS_CATEGORY_NAMES:
-        for keyword in keyword_map.get(
-            category_name,
-            [],
-        ):
-            jobs.append(
-                {
-                    "category": category_name,
-                    "keyword": keyword,
-                }
-            )
+        payload = response.json()
+        items = payload.get("items", [])
+        if not isinstance(items, list):
+            items = []
 
-    if not jobs:
+    except Exception as exc:
+        stats["feed_requests"] += 1
+        stats["feed_failures"] += 1
+        print(
+            f"[State PR Feed error] {exc}"
+        )
         return stats
 
-    def fetch_search_job(job):
-        try:
-            response = requests.get(
-                search_endpoint,
-                params={
-                    "search": job["keyword"],
-                    "per_page": 100,
-                    "subtype": "any",
-                },
-                timeout=DIRECT_TIMEOUT_SECONDS,
-                headers={
-                    "User-Agent": (
-                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) "
-                        "Chrome/124.0 Safari/537.36 "
-                        "GPA-News-Sensing/3.2.4"
-                    ),
-                    "Accept": "application/json,text/plain,*/*",
-                    "Accept-Language": "en-US,en;q=0.9",
-                },
-            )
-            response.raise_for_status()
+    stats["feed_items"] = len(items)
 
-            data = response.json()
-            if not isinstance(data, list):
-                data = []
-
-            return {
-                **job,
-                "items": data,
-                "error": None,
-            }
-
-        except Exception as exc:
-            return {
-                **job,
-                "items": [],
-                "error": str(exc),
-            }
-
-    search_results = []
-
-    workers = max(
-        1,
-        min(DIRECT_MAX_WORKERS, len(jobs)),
+    cutoff = (
+        datetime.now(timezone.utc)
+        - timedelta(hours=DIRECT_LOOKBACK_HOURS)
     )
 
-    with ThreadPoolExecutor(
-        max_workers=workers
-    ) as executor:
-        futures = [
-            executor.submit(
-                fetch_search_job,
-                job,
-            )
-            for job in jobs
-        ]
-
-        for future in as_completed(futures):
-            result = future.result()
-            stats["search_requests"] += 1
-
-            if result["error"]:
-                stats["search_failures"] += 1
-                continue
-
-            stats["search_results"] += len(
-                result["items"]
-            )
-            search_results.append(result)
-
-    # Same release may appear for several keywords/categories.
-    # Resolve detail only once per URL.
-    detail_cache = {}
     new_ids = set()
-    processed = set()
+    seen_links = set()
 
-    for result in search_results:
-        category_name = result["category"]
-        keyword = result["keyword"]
+    for item in items:
+        link = _canonicalize_url(
+            str(item.get("link") or "")
+        )
 
-        for item in result["items"]:
-            link = _canonicalize_url(
-                str(item.get("url") or "")
-            )
+        # 안전장치: 최종 링크는 반드시 공식 State.gov release URL
+        if not _state_release_url_allowed(link):
+            continue
 
-            # 가장 중요한 필터:
-            # State Press Release 이외의 일반 페이지는 무조건 제외.
-            if not _state_release_url_allowed(link):
-                continue
+        published_at = _parse_flexible_datetime(
+            item.get("published")
+        )
 
-            stats["release_candidates"] += 1
+        if (
+            published_at
+            and published_at < cutoff
+        ):
+            continue
 
-            dedupe_key = (
-                category_name,
-                keyword.lower(),
-                link,
-            )
-            if dedupe_key in processed:
-                continue
-            processed.add(dedupe_key)
+        stats["recent_items"] += 1
 
-            if link not in detail_cache:
-                detail = _fetch_state_rest_detail(
-                    item
+        if link in seen_links:
+            continue
+        seen_links.add(link)
+
+        stats["release_candidates"] += 1
+
+        title = BeautifulSoup(
+            str(item.get("title") or ""),
+            "html.parser",
+        ).get_text(" ", strip=True)
+
+        if not title:
+            continue
+
+        # -------------------------------------------------
+        # 핵심: STATE는 오직 TITLE만 검사
+        # summary/content는 매칭에 사용하지 않음
+        # -------------------------------------------------
+        matched_by_category = {}
+
+        for category_name in NEWS_CATEGORY_NAMES:
+            matched_keywords = [
+                keyword
+                for keyword in keyword_map.get(
+                    category_name,
+                    [],
                 )
-                detail_cache[link] = detail
-
-                if detail["ok"]:
-                    stats["detail_checked"] += 1
-                else:
-                    stats["detail_failures"] += 1
-
-            detail = detail_cache[link]
-
-            search_title = str(
-                item.get("title") or ""
-            ).strip()
-            title = (
-                detail["title"]
-                or search_title
-                or "(제목 정보 없음)"
-            )
-
-            excerpt = detail["excerpt"]
-            content = detail["content"]
-
-            search_text = "\n".join(
-                value
-                for value in (
+                if exact_phrase_match(
+                    keyword,
                     title,
-                    excerpt,
-                    content,
                 )
-                if value
-            )
+            ]
 
-            # 상세 JSON을 못 읽었더라도 WP search 결과 제목에서
-            # exact keyword가 맞으면 저장 가능.
-            if not exact_phrase_match(
-                keyword,
-                search_text,
-            ):
-                continue
+            if matched_keywords:
+                matched_by_category[
+                    category_name
+                ] = matched_keywords
 
+        if not matched_by_category:
+            continue
+
+        summary_raw = str(
+            item.get("summary") or ""
+        )
+        description = BeautifulSoup(
+            summary_raw,
+            "html.parser",
+        ).get_text(" ", strip=True)
+
+        for category_name, matched_keywords in (
+            matched_by_category.items()
+        ):
             stats["matched_articles"] += 1
-
-            description = (
-                excerpt
-                or content[:3000]
-                or title
-            )
 
             try:
                 article_id, is_new, _ = (
@@ -2432,11 +2290,9 @@ def collect_state_press_releases_api(
                         source=(
                             "U.S. Department of State"
                         ),
-                        published_at=detail[
-                            "published_at"
-                        ],
+                        published_at=published_at,
                         description=description,
-                        matched_keywords=[keyword],
+                        matched_keywords=matched_keywords,
                     )
                 )
 
@@ -2450,18 +2306,16 @@ def collect_state_press_releases_api(
 
             except Exception as exc:
                 print(
-                    f"[State WP Search save error] "
-                    f"{exc}"
+                    f"[State PR save error] {exc}"
                 )
 
     print(
-        "[State WP Search] "
-        f"requests={stats['search_requests']} "
-        f"failures={stats['search_failures']} "
-        f"results={stats['search_results']} "
+        "[State PR Feed] "
+        f"requests={stats['feed_requests']} "
+        f"failures={stats['feed_failures']} "
+        f"items={stats['feed_items']} "
+        f"recent={stats['recent_items']} "
         f"release_candidates={stats['release_candidates']} "
-        f"detail_checked={stats['detail_checked']} "
-        f"detail_failures={stats['detail_failures']} "
         f"matched={stats['matched_articles']} "
         f"new={stats['new_articles']}"
     )
@@ -3208,7 +3062,7 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
         "native": {},
     }
 
-    # 1. State.gov는 전용 API로 Press Release만 센싱
+    # 1. State.gov는 Press Release 전용 피드에서 제목만 센싱
     state_stats = collect_state_press_releases_api(
         keyword_map=keyword_map,
         enabled_domains=domains,
@@ -4047,7 +3901,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3.2.4",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2.6",
         page_icon="📰",
         layout="wide",
     )
@@ -4056,7 +3910,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "Keyword-First Hybrid: State WP Search 전용 + White House News + 언론사 검색 / "
+        "Keyword-First Hybrid: State PR 제목전용 + White House News + 언론사 검색 / "
         "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
         "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
