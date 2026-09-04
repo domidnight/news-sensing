@@ -160,20 +160,30 @@ DIRECT_SOURCE_PROFILES = {
     },
     "whitehouse.gov": {
         "label": "The White House",
-        # news/에는 Releases, Briefings, Presidential Actions,
-        # Fact Sheets, Remarks 등이 함께 노출됩니다.
+        # V3.2.2: White House는 News 허브에 노출되는 콘텐츠만 센싱
         "start_pages": [
             "https://www.whitehouse.gov/news/",
-            "https://www.whitehouse.gov/releases/",
-            "https://www.whitehouse.gov/briefings-statements/",
-            "https://www.whitehouse.gov/presidential-actions/",
+        ],
+        "listing_only": True,
+        "allowed_path_prefixes": [
+            "/releases/",
+            "/briefings-statements/",
+            "/presidential-actions/",
+            "/fact-sheets/",
+            "/remarks/",
+            "/research/",
         ],
     },
     "state.gov": {
         "label": "U.S. Department of State",
+        # V3.2.2: State Department는 Press Releases 목록만 센싱
+        # 실제 개별 press release URL은 /releases/... 형태
         "start_pages": [
-            "https://www.state.gov/",
-            "https://www.state.gov/releases/",
+            "https://www.state.gov/press-releases/",
+        ],
+        "listing_only": True,
+        "allowed_path_prefixes": [
+            "/releases/",
         ],
     },
 }
@@ -1283,6 +1293,36 @@ def _is_likely_article_url(url: str, domain: str) -> bool:
         return False
 
 
+
+def _url_allowed_for_profile(
+    url: str,
+    domain: str,
+    profile: dict | None = None,
+) -> bool:
+    """
+    공통 article URL 검사 + 출처별 허용 경로 검사.
+    Government scope처럼 특정 섹션만 센싱할 때 사용합니다.
+    """
+    if not _is_likely_article_url(url, domain):
+        return False
+
+    if not profile:
+        return True
+
+    prefixes = profile.get("allowed_path_prefixes") or []
+    if not prefixes:
+        return True
+
+    try:
+        path = urllib.parse.urlparse(url).path or "/"
+    except Exception:
+        return False
+
+    return any(
+        path.startswith(prefix)
+        for prefix in prefixes
+    )
+
 def _safe_get(url: str, timeout: int | None = None):
     return requests.get(
         url,
@@ -1425,14 +1465,20 @@ def _discover_direct_candidates_for_source(
     직접 기사 URL 후보를 모읍니다.
     """
     start_pages = profile.get("start_pages", [])
-    probe_urls = [
-        f"https://{domain}/robots.txt",
-        *start_pages,
-        *[
-            f"https://{domain}{path}"
-            for path in COMMON_SITEMAP_PATHS
-        ],
-    ]
+
+    if profile.get("listing_only"):
+        # State Press Releases / White House News처럼
+        # 특정 허브 페이지만 센싱하는 경우 사이트맵/robots 전체 탐색 금지
+        probe_urls = list(start_pages)
+    else:
+        probe_urls = [
+            f"https://{domain}/robots.txt",
+            *start_pages,
+            *[
+                f"https://{domain}{path}"
+                for path in COMMON_SITEMAP_PATHS
+            ],
+        ]
 
     candidates = []
     sitemap_urls = []
@@ -1495,9 +1541,10 @@ def _discover_direct_candidates_for_source(
                                 DIRECT_LOOKBACK_HOURS,
                             ):
                                 continue
-                            if _is_likely_article_url(
+                            if _url_allowed_for_profile(
                                 item["loc"],
                                 domain,
+                                profile,
                             ):
                                 candidates.append(
                                     _canonicalize_url(
@@ -1507,11 +1554,18 @@ def _discover_direct_candidates_for_source(
                     continue
 
                 # 일반 HTML listing
+                listing_links = _extract_listing_links(
+                    response.text,
+                    response.url or url,
+                    domain,
+                )
                 candidates.extend(
-                    _extract_listing_links(
-                        response.text,
-                        response.url or url,
+                    candidate_url
+                    for candidate_url in listing_links
+                    if _url_allowed_for_profile(
+                        candidate_url,
                         domain,
+                        profile,
                     )
                 )
 
@@ -1575,9 +1629,10 @@ def _discover_direct_candidates_for_source(
                             url = _canonicalize_url(
                                 item["loc"]
                             )
-                            if _is_likely_article_url(
+                            if _url_allowed_for_profile(
                                 url,
                                 domain,
+                                profile,
                             ):
                                 candidates.append(url)
 
@@ -1656,9 +1711,10 @@ def _discover_direct_candidates_for_source(
                                 url = _canonicalize_url(
                                     item["loc"]
                                 )
-                                if _is_likely_article_url(
+                                if _url_allowed_for_profile(
                                     url,
                                     domain,
+                                    profile,
                                 ):
                                     candidates.append(url)
 
@@ -1977,6 +2033,7 @@ def _extract_native_search_candidates(
     html: str,
     search_url: str,
     target_domain: str,
+    allowed_path_prefixes: list[str] | None = None,
 ) -> list[dict]:
     """
     사이트 자체 검색결과에서 실제 기사 링크 + 제목 + 주변 문맥/날짜를 추출.
@@ -2007,6 +2064,16 @@ def _extract_native_search_candidates(
             target_domain,
         ):
             continue
+
+        if allowed_path_prefixes:
+            path = urllib.parse.urlparse(
+                absolute
+            ).path or "/"
+            if not any(
+                path.startswith(prefix)
+                for prefix in allowed_path_prefixes
+            ):
+                continue
 
         if absolute in seen:
             continue
@@ -2098,8 +2165,26 @@ def collect_native_keyword_searches(
         for keyword in keyword_map.get(category_name, []):
             for domain in enabled:
                 profile = NATIVE_SEARCH_TEMPLATES[domain]
-                query = urllib.parse.quote_plus(keyword)
-                search_url = profile["url"].format(query=query)
+
+                search_term = keyword
+                if domain == "state.gov":
+                    # Search.gov가 State 전체 페이지를 반환하지 않도록
+                    # 실제 press release URL 경로로 검색 범위 제한
+                    search_term = (
+                        f'{keyword} site:state.gov/releases/'
+                    )
+
+                query = urllib.parse.quote_plus(
+                    search_term
+                )
+                search_url = profile["url"].format(
+                    query=query
+                )
+
+                scope_profile = DIRECT_SOURCE_PROFILES.get(
+                    domain,
+                    {},
+                )
 
                 search_jobs.append(
                     {
@@ -2108,6 +2193,12 @@ def collect_native_keyword_searches(
                         "domain": domain,
                         "label": profile["label"],
                         "url": search_url,
+                        "allowed_path_prefixes": (
+                            scope_profile.get(
+                                "allowed_path_prefixes"
+                            )
+                            or []
+                        ),
                     }
                 )
 
@@ -2139,6 +2230,7 @@ def collect_native_keyword_searches(
                     response.text,
                     response.url or job["url"],
                     job["domain"],
+                    job.get("allowed_path_prefixes"),
                 )
 
                 for candidate in candidates:
@@ -2794,7 +2886,21 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
 
     for raw in domains:
         value = normalize_domain(raw)
-        if value and value not in seen_domains:
+        if not value:
+            continue
+
+        base_domain = value.split("/")[0]
+
+        # V3.2.2:
+        # State/White House는 특정 공식 섹션만 허용하므로
+        # 사이트 전체를 뒤지는 Google News 검색에서는 제외.
+        if base_domain in {
+            "state.gov",
+            "whitehouse.gov",
+        }:
+            continue
+
+        if value not in seen_domains:
             seen_domains.add(value)
             clean_domains.append(value)
 
@@ -3196,6 +3302,46 @@ def summarize_pending_articles(limit: int = 10) -> dict:
 # 6. 화면용 조회
 # =========================================================
 
+
+def _article_in_allowed_government_scope(
+    link: str,
+    source: str,
+) -> bool:
+    """
+    이미 DB에 저장된 과거 직접수집 항목도 화면에서 정부 섹션 범위를 지킵니다.
+    - State Department: /releases/ 만
+    - White House: News 허브에 속하는 6개 콘텐츠 경로만
+
+    news.google.com redirect처럼 실제 원문 경로를 알 수 없는 과거 항목은
+    기존 데이터 보존을 위해 그대로 둡니다.
+    """
+    host = _host_from_url(link)
+
+    if host == "state.gov":
+        path = urllib.parse.urlparse(
+            link
+        ).path or "/"
+        return path.startswith("/releases/")
+
+    if host == "whitehouse.gov":
+        path = urllib.parse.urlparse(
+            link
+        ).path or "/"
+        allowed = (
+            "/releases/",
+            "/briefings-statements/",
+            "/presidential-actions/",
+            "/fact-sheets/",
+            "/remarks/",
+            "/research/",
+        )
+        return any(
+            path.startswith(prefix)
+            for prefix in allowed
+        )
+
+    return True
+
 def get_category_articles(
     category_name: str,
     period_hours: int | None = 48,
@@ -3258,6 +3404,12 @@ def get_category_articles(
         result = []
 
         for article in articles:
+            if not _article_in_allowed_government_scope(
+                article.link,
+                article.source,
+            ):
+                continue
+
             tags = session.scalars(
                 select(ArticleMatch.keyword)
                 .where(
@@ -3522,7 +3674,7 @@ def render_social_card(article: dict, category_name: str):
 
 def main():
     st.set_page_config(
-        page_title="GPA 뉴스 센싱 대시보드 V3.2.1",
+        page_title="GPA 뉴스 센싱 대시보드 V3.2.2",
         page_icon="📰",
         layout="wide",
     )
@@ -3531,7 +3683,7 @@ def main():
 
     st.title("📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드 V3")
     st.caption(
-        "Keyword-First Hybrid: 키워드별 Google News + 사이트 자체검색 + 직접 센싱 / "
+        "Keyword-First Hybrid: 언론사 검색 + State Press Releases + White House News 전용 센싱 / "
         "키워드·언론사 영구 저장 / 뉴스 5개 + 소셜 3개 탭 / "
         "정확 구문·AND 검색 / Gemini 3줄 요약"
     )
