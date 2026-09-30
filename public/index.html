@@ -1,0 +1,76 @@
+<!doctype html>
+<html lang="ko">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>GPA 뉴스 센싱 대시보드</title>
+  <link rel="stylesheet" href="/styles.css" />
+</head>
+<body>
+  <header class="topbar">
+    <div>
+      <h1>📰 글로벌 대외협력(GPA) 뉴스 센싱 대시보드</h1>
+      <p>Keyword-First Hybrid · State PR 제목전용 · White House News · 언론사 검색 · Neon DB</p>
+    </div>
+    <button id="settingsBtn" class="ghost">⚙️ 관리자 설정</button>
+  </header>
+
+  <main>
+    <section class="toolbar card">
+      <button id="collectBtn" class="primary">🔄 지금 새 뉴스·소셜 수집</button>
+      <div class="stat" id="dbStat">DB 연결 중…</div>
+      <div class="controls">
+        <label>기간 기준
+          <select id="basisSelect">
+            <option value="published">기사 발행/소셜 게시 시각</option>
+            <option value="detected">최초 감지 시각</option>
+          </select>
+        </label>
+        <label>기간
+          <select id="periodSelect">
+            <option value="12">최근 12시간</option>
+            <option value="24">최근 24시간</option>
+            <option value="48" selected>최근 48시간</option>
+            <option value="168">최근 7일</option>
+            <option value="720">최근 30일</option>
+            <option value="all">전체</option>
+          </select>
+        </label>
+      </div>
+    </section>
+
+    <nav id="tabs" class="tabs"></nav>
+    <section id="categoryInfo" class="category-info"></section>
+    <section id="status"></section>
+    <section id="articles"></section>
+  </main>
+
+  <dialog id="settingsDialog">
+    <form method="dialog" class="dialog-card">
+      <div class="dialog-head">
+        <h2>⚙️ 관리자 설정</h2>
+        <button value="cancel" class="ghost">✕</button>
+      </div>
+      <div id="loginPane">
+        <label>관리자 비밀번호
+          <input id="adminPassword" type="password" autocomplete="current-password" />
+        </label>
+        <button id="unlockBtn" type="button" class="primary">🔐 설정 열기</button>
+        <p id="loginMessage" class="muted"></p>
+      </div>
+      <div id="settingsPane" hidden>
+        <div id="keywordEditors"></div>
+        <label>🌐 탐색할 사이트
+          <textarea id="domainsInput" rows="10"></textarea>
+        </label>
+        <div class="dialog-actions">
+          <button id="saveSettingsBtn" type="button" class="primary">💾 설정 영구 저장</button>
+        </div>
+        <p id="saveMessage" class="muted"></p>
+      </div>
+    </form>
+  </dialog>
+
+  <script type="module" src="/app.js"></script>
+</body>
+</html>
