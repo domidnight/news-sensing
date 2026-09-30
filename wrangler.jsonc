@@ -1,0 +1,18 @@
+{
+  "$schema": "./node_modules/wrangler/config-schema.json",
+  "name": "news-sensing",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-30",
+  "assets": {
+    "directory": "./public",
+    "binding": "ASSETS",
+    "not_found_handling": "single-page-application",
+    "run_worker_first": ["/api/*"]
+  },
+  "triggers": {
+    "crons": ["*/30 * * * *"]
+  },
+  "vars": {
+    "GEMINI_MODEL": "gemini-3.6-flash"
+  }
+}
