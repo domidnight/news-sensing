@@ -96,13 +96,18 @@ async function saveSettings(){
   }catch(e){$("#saveMessage").textContent=e.message;}
 }
 async function collectNow(){
-  if(!state.adminPassword){$("#settingsDialog").showModal();return;}
-  const b=$("#collectBtn");b.disabled=true;b.textContent="수집 작업 시작 중…";
+  const b=$("#collectBtn");
+  b.disabled=true;
+  b.textContent="새로고침 중…";
   try{
-    const d=await api("/api/collect",{method:"POST",headers:adminHeaders(),body:"{}"});
-    alert(d.message);setTimeout(async()=>{await boot();await loadArticles();},45000);
-  }catch(e){alert(e.message);}
-  finally{b.disabled=false;b.textContent="🔄 지금 새 뉴스·소셜 수집";}
+    await boot();
+    await loadArticles();
+  }catch(e){
+    alert(e.message);
+  }finally{
+    b.disabled=false;
+    b.textContent="🔄 화면 새로고침";
+  }
 }
 
 $("#basisSelect").onchange=loadArticles;
