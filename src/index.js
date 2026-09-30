@@ -314,15 +314,35 @@ ${rows[0].title}
 ${String(rows[0].description || "").slice(0, 2500)}`;
 
   const model = env.GEMINI_MODEL || "gemini-3.6-flash";
-  const resp = await fetch(`https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`, {
-    method: "POST",
-    headers: { "content-type": "application/json" },
-    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-  });
-  if (!resp.ok) {
-    const txt = await resp.text();
-    return json({ error: resp.status === 429 ? "Gemini 무료 한도가 소진되었습니다." : `요약 실패: ${txt.slice(0,200)}` }, resp.status === 429 ? 429 : 502);
+  const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
+
+  let resp = null;
+  for (let attempt = 1; attempt <= 3; attempt++) {
+    resp = await fetch(endpoint, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+    });
+
+    if (resp.ok || resp.status !== 503 || attempt === 3) break;
+
+    // Gemini가 일시적으로 혼잡할 때 잠깐 기다렸다가 자동 재시도합니다.
+    await new Promise(resolve => setTimeout(resolve, attempt * 1200));
   }
+
+  if (!resp.ok) {
+    if (resp.status === 429) {
+      return json({ error: "Gemini 무료 한도가 소진되었습니다. 다음 한도 갱신 후 다시 시도해 주세요." }, 429);
+    }
+
+    if (resp.status === 503) {
+      return json({ error: "Gemini 서버가 지금 혼잡합니다. 잠시 후 다시 눌러 주세요. 이번 실패는 수동 요약 횟수에 포함되지 않습니다." }, 503);
+    }
+
+    const txt = await resp.text();
+    return json({ error: `요약 서비스 오류(${resp.status}). 잠시 후 다시 시도해 주세요.`, detail: txt.slice(0,120) }, 502);
+  }
+
   const data = await resp.json();
   const summary = data?.candidates?.[0]?.content?.parts?.map(x => x.text || "").join("").trim();
   if (!summary) return json({ error: "요약 결과가 비어 있습니다." }, 502);
