@@ -5,12 +5,14 @@
   "type": "module",
   "scripts": {
     "deploy": "wrangler deploy",
-    "dev": "wrangler dev"
+    "dev": "wrangler dev",
+    "build:pages": "node scripts/build-pages.mjs"
   },
   "dependencies": {
     "@neondatabase/serverless": "^1.0.0"
   },
   "devDependencies": {
-    "wrangler": "^4.0.0"
+    "wrangler": "^4.0.0",
+    "esbuild": "^0.25.0"
   }
 }
