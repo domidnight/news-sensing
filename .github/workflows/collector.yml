@@ -2,9 +2,6 @@ name: GPA News Collector
 
 on:
   workflow_dispatch:
-  schedule:
-    # Avoid the top-of-hour congestion while still running every 30 minutes.
-    - cron: "17,47 * * * *"
 
 permissions:
   contents: write
@@ -40,22 +37,3 @@ jobs:
 
       - name: Run collector
         run: python collector.py
-
-      # Public repositories can have scheduled workflows disabled after long periods
-      # without repository activity. This tiny monthly heartbeat is committed by the
-      # built-in GITHUB_TOKEN so the collector can stay hands-off.
-      - name: Monthly keepalive
-        if: github.event_name == 'schedule'
-        shell: bash
-        run: |
-          if [ "$(date -u +%d)" = "01" ] && [ "$(date -u +%M)" = "17" ]; then
-            mkdir -p .github
-            date -u +"%Y-%m-%d" > .github/collector-keepalive
-            git config user.name "github-actions[bot]"
-            git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-            git add .github/collector-keepalive
-            if ! git diff --cached --quiet; then
-              git commit -m "chore: keep scheduled collector active"
-              git push
-            fi
-          fi
