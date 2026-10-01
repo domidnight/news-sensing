@@ -256,13 +256,19 @@ async function settingsGet(request, env) {
 
 async function settingsSave(request, env) {
   if (!(await requireAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
+
   const body = await readJson(request);
-  const keywordMap = body.keywordMap && typeof body.keywordMap === "object" ? body.keywordMap : {};
+  const keywordMap =
+    body.keywordMap && typeof body.keywordMap === "object"
+      ? body.keywordMap
+      : {};
   const sql = getSql(env);
 
-  // Each category is replaced in ONE PostgreSQL statement.
-  // This prevents a temporary empty category when a request is interrupted
-  // between DELETE and INSERT. A missing category in the request is preserved.
+  // Build one real PostgreSQL transaction for ALL submitted settings.
+  // If any delete/insert fails, the whole save rolls back so no category
+  // can be left half-saved or accidentally empty.
+  const tx = [];
+
   for (const name of NEWS_CATEGORY_NAMES) {
     if (!Object.prototype.hasOwnProperty.call(keywordMap, name)) continue;
     if (!Array.isArray(keywordMap[name])) continue;
@@ -277,27 +283,28 @@ async function settingsSave(request, env) {
       cleanKeywords.push(kw);
     }
 
-    await sql.query(
-      `WITH cat AS (
-         SELECT id FROM categories WHERE name=$1 LIMIT 1
-       ),
-       deleted AS (
-         DELETE FROM keywords k
-         USING cat
-         WHERE k.category_id=cat.id
-         RETURNING k.id
-       )
-       INSERT INTO keywords(category_id, keyword)
-       SELECT cat.id, value
-       FROM cat
-       CROSS JOIN LATERAL jsonb_array_elements_text($2::jsonb) AS j(value)`,
-      [name, JSON.stringify(cleanKeywords)]
-    );
+    tx.push(sql`
+      DELETE FROM keywords
+      WHERE category_id = (
+        SELECT id FROM categories WHERE name = ${name} LIMIT 1
+      )
+    `);
+
+    tx.push(sql`
+      INSERT INTO keywords(category_id, keyword)
+      SELECT c.id, j.value
+      FROM categories c
+      CROSS JOIN LATERAL jsonb_array_elements_text(
+        ${JSON.stringify(cleanKeywords)}::jsonb
+      ) AS j(value)
+      WHERE c.name = ${name}
+    `);
   }
 
   if (Array.isArray(body.domains)) {
     const seenDomains = new Set();
     const cleanDomains = [];
+
     for (const raw of body.domains) {
       const domain = normalizeDomain(raw);
       if (!domain || seenDomains.has(domain)) continue;
@@ -305,20 +312,36 @@ async function settingsSave(request, env) {
       cleanDomains.push(domain);
     }
 
-    await sql.query(
-      `WITH deleted AS (
-         DELETE FROM sources
-         RETURNING id
-       )
-       INSERT INTO sources(domain, enabled)
-       SELECT value, TRUE
-       FROM jsonb_array_elements_text($1::jsonb) AS j(value)`,
-      [JSON.stringify(cleanDomains)]
+    tx.push(sql`DELETE FROM sources`);
+    tx.push(sql`
+      INSERT INTO sources(domain, enabled)
+      SELECT value, TRUE
+      FROM jsonb_array_elements_text(
+        ${JSON.stringify(cleanDomains)}::jsonb
+      ) AS j(value)
+    `);
+  }
+
+  if (!tx.length) {
+    return json({ error: "저장할 설정이 없습니다." }, 400);
+  }
+
+  try {
+    await sql.transaction(tx);
+  } catch (e) {
+    console.error("Settings transaction failed", e);
+    return json(
+      { error: "설정 저장 중 DB 오류가 발생했습니다. 기존 설정은 그대로 보존되었습니다." },
+      500
     );
   }
 
   const saved = await bootstrap(env);
-  return json({ ok: true, keywordMap: saved.keywordMap, domains: saved.sources });
+  return json({
+    ok: true,
+    keywordMap: saved.keywordMap,
+    domains: saved.sources,
+  });
 }
 
 async function summarize(request, env) {
