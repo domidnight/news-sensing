@@ -91,8 +91,8 @@ async function saveSettings(){
   const domains=parseLines($("#domainsInput").value);
   try{
     const saved=await api("/api/settings",{method:"POST",headers:adminHeaders(),body:JSON.stringify({keywordMap,domains})});
-    const texasCount=(saved.keywordMap?.["텍사스"]||[]).length;
-    $("#saveMessage").textContent=`설정이 Neon DB에 영구 저장되었습니다. · 텍사스 키워드 ${texasCount}개 확인`;
+    const counts=NEWS.map(name=>`${name} ${(saved.keywordMap?.[name]||[]).length}개`).join(" · ");
+    $("#saveMessage").textContent=`설정이 Neon DB에 영구 저장되었습니다. · ${counts}`;
     document.querySelectorAll("[data-keycat]").forEach(t=>{
       const values=saved.keywordMap?.[t.dataset.keycat];
       if(Array.isArray(values)) t.value=values.join("\n");
