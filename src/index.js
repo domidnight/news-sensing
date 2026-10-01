@@ -257,32 +257,68 @@ async function settingsGet(request, env) {
 async function settingsSave(request, env) {
   if (!(await requireAdmin(request, env))) return json({ error: "Unauthorized" }, 401);
   const body = await readJson(request);
-  const keywordMap = body.keywordMap || {};
-  const domains = Array.isArray(body.domains) ? body.domains.map(normalizeDomain).filter(Boolean) : [];
+  const keywordMap = body.keywordMap && typeof body.keywordMap === "object" ? body.keywordMap : {};
   const sql = getSql(env);
 
+  // Each category is replaced in ONE PostgreSQL statement.
+  // This prevents a temporary empty category when a request is interrupted
+  // between DELETE and INSERT. A missing category in the request is preserved.
   for (const name of NEWS_CATEGORY_NAMES) {
-    const rows = await sql.query("SELECT id FROM categories WHERE name=$1 LIMIT 1", [name]);
-    if (!rows.length) continue;
-    const categoryId = rows[0].id;
-    await sql.query("DELETE FROM keywords WHERE category_id=$1", [categoryId]);
+    if (!Object.prototype.hasOwnProperty.call(keywordMap, name)) continue;
+    if (!Array.isArray(keywordMap[name])) continue;
+
     const seen = new Set();
-    for (const raw of Array.isArray(keywordMap[name]) ? keywordMap[name] : []) {
+    const cleanKeywords = [];
+    for (const raw of keywordMap[name]) {
       const kw = normalizeKeyword(raw);
-      if (!kw || seen.has(kw.toLowerCase())) continue;
-      seen.add(kw.toLowerCase());
-      await sql.query("INSERT INTO keywords(category_id, keyword) VALUES($1,$2)", [categoryId, kw]);
+      const key = kw.toLowerCase();
+      if (!kw || seen.has(key)) continue;
+      seen.add(key);
+      cleanKeywords.push(kw);
     }
+
+    await sql.query(
+      `WITH cat AS (
+         SELECT id FROM categories WHERE name=$1 LIMIT 1
+       ),
+       deleted AS (
+         DELETE FROM keywords k
+         USING cat
+         WHERE k.category_id=cat.id
+         RETURNING k.id
+       )
+       INSERT INTO keywords(category_id, keyword)
+       SELECT cat.id, value
+       FROM cat
+       CROSS JOIN LATERAL jsonb_array_elements_text($2::jsonb) AS j(value)`,
+      [name, JSON.stringify(cleanKeywords)]
+    );
   }
 
-  await sql.query("DELETE FROM sources", []);
-  const seenDomains = new Set();
-  for (const domain of domains) {
-    if (seenDomains.has(domain)) continue;
-    seenDomains.add(domain);
-    await sql.query("INSERT INTO sources(domain, enabled) VALUES($1, TRUE)", [domain]);
+  if (Array.isArray(body.domains)) {
+    const seenDomains = new Set();
+    const cleanDomains = [];
+    for (const raw of body.domains) {
+      const domain = normalizeDomain(raw);
+      if (!domain || seenDomains.has(domain)) continue;
+      seenDomains.add(domain);
+      cleanDomains.push(domain);
+    }
+
+    await sql.query(
+      `WITH deleted AS (
+         DELETE FROM sources
+         RETURNING id
+       )
+       INSERT INTO sources(domain, enabled)
+       SELECT value, TRUE
+       FROM jsonb_array_elements_text($1::jsonb) AS j(value)`,
+      [JSON.stringify(cleanDomains)]
+    );
   }
-  return json({ ok: true });
+
+  const saved = await bootstrap(env);
+  return json({ ok: true, keywordMap: saved.keywordMap, domains: saved.sources });
 }
 
 async function summarize(request, env) {
