@@ -515,28 +515,41 @@ def init_db():
 
 def purge_old_articles(retention_days: int = ARTICLE_RETENTION_DAYS) -> int:
     """
-    보존 기간이 지난 기사를 DB에서 삭제합니다.
+    보존 기간이 지난 기사와 연결 레코드를 DB에서 삭제합니다.
 
     - published_at이 있으면 기사 발행일 기준
     - published_at이 없으면 DB 감지일(detected_at) 기준
-    - ArticleMatch는 FK CASCADE로 함께 삭제
-    - SummaryUsage는 FK SET NULL로 사용량 기록만 유지
+    - 연결 레코드를 먼저 지워 기존 운영 DB의 FK 설정 차이에도 안전하게 동작
     """
     days = max(1, int(retention_days))
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
+    old_article_filter = (
+        (
+            Article.published_at.is_not(None)
+            & (Article.published_at < cutoff)
+        )
+        | (
+            Article.published_at.is_(None)
+            & (Article.detected_at < cutoff)
+        )
+    )
+
     with SessionLocal() as session:
-        result = session.execute(
-            delete(Article).where(
-                (
-                    Article.published_at.is_not(None)
-                    & (Article.published_at < cutoff)
-                )
-                | (
-                    Article.published_at.is_(None)
-                    & (Article.detected_at < cutoff)
-                )
+        old_article_ids = select(Article.id).where(old_article_filter)
+
+        session.execute(
+            delete(ArticleMatch).where(
+                ArticleMatch.article_id.in_(old_article_ids)
             )
+        )
+        session.execute(
+            delete(SummaryUsage).where(
+                SummaryUsage.article_id.in_(old_article_ids)
+            )
+        )
+        result = session.execute(
+            delete(Article).where(old_article_filter)
         )
         deleted_count = int(result.rowcount or 0)
         session.commit()
