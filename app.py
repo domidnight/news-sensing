@@ -519,12 +519,13 @@ def purge_old_articles(retention_days: int = ARTICLE_RETENTION_DAYS) -> int:
 
     - published_at이 있으면 기사 발행일 기준
     - published_at이 없으면 DB 감지일(detected_at) 기준
+    - 공개 X 소셜 게시물은 기사 보존 정책에서 제외
     - 연결 레코드를 먼저 지워 기존 운영 DB의 FK 설정 차이에도 안전하게 동작
     """
     days = max(1, int(retention_days))
     cutoff = datetime.now(timezone.utc) - timedelta(days=days)
 
-    old_article_filter = (
+    age_filter = (
         (
             Article.published_at.is_not(None)
             & (Article.published_at < cutoff)
@@ -533,6 +534,12 @@ def purge_old_articles(retention_days: int = ARTICLE_RETENTION_DAYS) -> int:
             Article.published_at.is_(None)
             & (Article.detected_at < cutoff)
         )
+    )
+    # 공개 X 게시물도 같은 articles 테이블을 사용하므로
+    # 기사 보존 정책에서는 소셜 기록을 제외합니다.
+    old_article_filter = (
+        Article.source.not_like("X · @%")
+        & age_filter
     )
 
     with SessionLocal() as session:
