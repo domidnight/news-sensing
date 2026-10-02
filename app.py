@@ -65,6 +65,12 @@ KST = timezone(timedelta(hours=9))
 # Google News 검색 시 최근 몇 시간을 볼지 설정
 SEARCH_LOOKBACK_HOURS = int(os.environ.get("SEARCH_LOOKBACK_HOURS", "48"))
 
+# DB 기사 보존 기간. published_at이 없으면 detected_at을 기준으로 정리합니다.
+ARTICLE_RETENTION_DAYS = max(
+    1,
+    int(os.environ.get("ARTICLE_RETENTION_DAYS", "30")),
+)
+
 # Gemini 모델명은 Railway 변수에서 바꿀 수 있음
 GEMINI_MODEL = os.environ.get("GEMINI_MODEL", "gemini-3.6-flash")
 
@@ -505,6 +511,37 @@ def init_db():
                 )
 
         session.commit()
+
+
+def purge_old_articles(retention_days: int = ARTICLE_RETENTION_DAYS) -> int:
+    """
+    보존 기간이 지난 기사를 DB에서 삭제합니다.
+
+    - published_at이 있으면 기사 발행일 기준
+    - published_at이 없으면 DB 감지일(detected_at) 기준
+    - ArticleMatch는 FK CASCADE로 함께 삭제
+    - SummaryUsage는 FK SET NULL로 사용량 기록만 유지
+    """
+    days = max(1, int(retention_days))
+    cutoff = datetime.now(timezone.utc) - timedelta(days=days)
+
+    with SessionLocal() as session:
+        result = session.execute(
+            delete(Article).where(
+                (
+                    Article.published_at.is_not(None)
+                    & (Article.published_at < cutoff)
+                )
+                | (
+                    Article.published_at.is_(None)
+                    & (Article.detected_at < cutoff)
+                )
+            )
+        )
+        deleted_count = int(result.rowcount or 0)
+        session.commit()
+
+    return deleted_count
 
 
 # =========================================================
