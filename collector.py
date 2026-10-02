@@ -1,19 +1,22 @@
 """
-Railway Cron에서 30분마다 실행되는 V3 Hybrid 뉴스 + 공개 소셜 수집기입니다.
+Cloudflare Cron이 GitHub Actions를 통해 실행하는 V3 Hybrid 뉴스 + 공개 소셜 수집기입니다.
 """
 
 from app import (
+    ARTICLE_RETENTION_DAYS,
     AUTO_SUMMARY_DAILY_LIMIT,
     collect_all_categories,
     collect_social_posts,
     get_summary_quota_status,
     init_db,
+    purge_old_articles,
     summarize_pending_articles,
 )
 
 
 def main():
     init_db()
+    purged_old_articles = purge_old_articles()
 
     # Hybrid news collection:
     # 직접 센싱 + Google News RSS 보조망
@@ -33,6 +36,12 @@ def main():
 
     print(
         "=== GPA V3.2 KEYWORD-FIRST HYBRID COLLECTOR COMPLETE ==="
+    )
+    print(
+        f"Article retention days : {ARTICLE_RETENTION_DAYS}"
+    )
+    print(
+        f"Old articles purged    : {purged_old_articles}"
     )
     print(
         f"Direct sources enabled : "
