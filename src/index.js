@@ -425,8 +425,15 @@ ${String(rows[0].description || "").slice(0, 2500)}`;
 
   if (!resp.ok) {
     if (resp.status === 429) {
+      const detail = await resp.text();
+      const minuteLimited =
+        detail.includes("GenerateRequestsPerMinute") ||
+        detail.includes("PerMinutePerProjectPerModel");
+
       return json({
-        error: "Gemini API 프로젝트의 실제 무료 일일 한도가 소진되었습니다. 한도는 KST 오전 9시에 갱신됩니다."
+        error: minuteLimited
+          ? "Gemini의 1분 요청 한도에 잠시 걸렸습니다. 약 1분 후 다시 시도해 주세요. 이번 요청 1회는 실제 요청 횟수에 반영되었습니다."
+          : "Gemini API 프로젝트의 실제 무료 일일 한도가 소진되었습니다. 한도는 KST 오전 9시에 갱신됩니다."
       }, 429);
     }
 
