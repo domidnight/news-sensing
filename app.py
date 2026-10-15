@@ -298,6 +298,10 @@ AUTO_SUMMARY_DAILY_LIMIT = max(
     0,
     int(os.environ.get("AUTO_SUMMARY_DAILY_LIMIT", "10")),
 )
+AUTO_SUMMARY_PER_RUN_LIMIT = max(
+    0,
+    int(os.environ.get("AUTO_SUMMARY_PER_RUN_LIMIT", "2")),
+)
 MANUAL_SUMMARY_DAILY_LIMIT = max(
     0,
     int(os.environ.get("MANUAL_SUMMARY_DAILY_LIMIT", "10")),
