@@ -8,13 +8,11 @@ import email.utils
 import xml.etree.ElementTree as ET
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import datetime, timezone, timedelta
-from zoneinfo import ZoneInfo
 
 import feedparser
 import requests
 import streamlit as st
 from bs4 import BeautifulSoup
-from google import genai
 
 from sqlalchemy import (
     Boolean,
@@ -289,10 +287,21 @@ NATIVE_SEARCH_MAX_ARTICLE_FETCHES = int(
 
 
 
-# Gemini 무료 한도 보호: 자동 10회 + 수동 10회
-AUTO_SUMMARY_DAILY_LIMIT = int(os.environ.get("AUTO_SUMMARY_DAILY_LIMIT", "10"))
-MANUAL_SUMMARY_DAILY_LIMIT = int(os.environ.get("MANUAL_SUMMARY_DAILY_LIMIT", "10"))
-GEMINI_QUOTA_TZ = ZoneInfo("America/Los_Angeles")
+# Gemini 무료 한도 보호.
+# 실제 free-tier 한도는 같은 프로젝트/모델의 요청을 합산하므로
+# 성공한 요약 수가 아니라 "실제 API 요청 시도"를 기록합니다.
+GEMINI_DAILY_REQUEST_LIMIT = max(
+    1,
+    int(os.environ.get("GEMINI_DAILY_REQUEST_LIMIT", "20")),
+)
+AUTO_SUMMARY_DAILY_LIMIT = max(
+    0,
+    int(os.environ.get("AUTO_SUMMARY_DAILY_LIMIT", "10")),
+)
+MANUAL_SUMMARY_DAILY_LIMIT = max(
+    0,
+    int(os.environ.get("MANUAL_SUMMARY_DAILY_LIMIT", "10")),
+)
 _LAST_SUMMARY_ERROR = None
 
 # 최초 1회만 DB에 들어가는 기본값.
@@ -976,13 +985,18 @@ def save_settings(keyword_map: dict[str, list[str]], domains: list[str]):
 
 
 def _gemini_day_start_utc() -> datetime:
-    """Gemini 일일 quota 리셋 기준(Pacific Time)의 오늘 00:00을 UTC로 반환."""
-    now_pt = datetime.now(GEMINI_QUOTA_TZ)
-    start_pt = now_pt.replace(hour=0, minute=0, second=0, microsecond=0)
-    return start_pt.astimezone(timezone.utc)
+    """Gemini free-tier 일일 한도는 UTC 00:00에 갱신됩니다 (KST 09:00)."""
+    now_utc = datetime.now(timezone.utc)
+    return now_utc.replace(
+        hour=0,
+        minute=0,
+        second=0,
+        microsecond=0,
+    )
 
 
 def summary_usage_today(mode: str) -> int:
+    """오늘(UTC 기준) 실제 Gemini API 요청 시도 횟수."""
     start_utc = _gemini_day_start_utc()
     with SessionLocal() as session:
         return session.scalar(
@@ -993,15 +1007,48 @@ def summary_usage_today(mode: str) -> int:
         ) or 0
 
 
+def total_summary_requests_today() -> int:
+    start_utc = _gemini_day_start_utc()
+    with SessionLocal() as session:
+        return session.scalar(
+            select(func.count(SummaryUsage.id)).where(
+                SummaryUsage.used_at >= start_utc,
+            )
+        ) or 0
+
+
 def summary_limit(mode: str) -> int:
-    return AUTO_SUMMARY_DAILY_LIMIT if mode == "auto" else MANUAL_SUMMARY_DAILY_LIMIT
+    if mode == "auto":
+        # 수동 10회 몫을 항상 남겨 자동요약이 침범하지 못하게 합니다.
+        auto_ceiling = max(
+            0,
+            GEMINI_DAILY_REQUEST_LIMIT - MANUAL_SUMMARY_DAILY_LIMIT,
+        )
+        return min(AUTO_SUMMARY_DAILY_LIMIT, auto_ceiling)
+
+    if mode == "manual":
+        return min(
+            MANUAL_SUMMARY_DAILY_LIMIT,
+            GEMINI_DAILY_REQUEST_LIMIT,
+        )
+
+    raise ValueError(f"Unknown summary mode: {mode}")
 
 
 def remaining_summary_quota(mode: str) -> int:
-    return max(0, summary_limit(mode) - summary_usage_today(mode))
+    mode_remaining = max(
+        0,
+        summary_limit(mode) - summary_usage_today(mode),
+    )
+    total_remaining = max(
+        0,
+        GEMINI_DAILY_REQUEST_LIMIT - total_summary_requests_today(),
+    )
+    return min(mode_remaining, total_remaining)
 
 
 def record_summary_usage(mode: str, article_id: int | None):
+    """Gemini 호출 직전에 요청 시도 1회를 기록합니다. 성공 여부와 무관합니다."""
     with SessionLocal() as session:
         session.add(
             SummaryUsage(
@@ -1016,13 +1063,24 @@ def record_summary_usage(mode: str, article_id: int | None):
 def get_summary_quota_status() -> dict:
     auto_used = summary_usage_today("auto")
     manual_used = summary_usage_today("manual")
+    total_used = auto_used + manual_used
+    auto_limit = summary_limit("auto")
+    manual_limit = summary_limit("manual")
+
     return {
         "auto_used": auto_used,
-        "auto_limit": AUTO_SUMMARY_DAILY_LIMIT,
-        "auto_remaining": max(0, AUTO_SUMMARY_DAILY_LIMIT - auto_used),
+        "auto_limit": auto_limit,
+        "auto_remaining": max(0, auto_limit - auto_used),
         "manual_used": manual_used,
-        "manual_limit": MANUAL_SUMMARY_DAILY_LIMIT,
-        "manual_remaining": max(0, MANUAL_SUMMARY_DAILY_LIMIT - manual_used),
+        "manual_limit": manual_limit,
+        "manual_remaining": max(0, manual_limit - manual_used),
+        "total_used": total_used,
+        "total_limit": GEMINI_DAILY_REQUEST_LIMIT,
+        "total_remaining": max(
+            0,
+            GEMINI_DAILY_REQUEST_LIMIT - total_used,
+        ),
+        "reset_at_kst": "09:00",
     }
 
 
@@ -1030,9 +1088,23 @@ def get_summary_quota_status() -> dict:
 # 4. Gemini 3줄 요약
 # =========================================================
 
-def summarize_article(title: str, description: str) -> str | None:
+def summarize_article(
+    title: str,
+    description: str,
+    *,
+    mode: str,
+    article_id: int | None,
+) -> str | None:
+    """
+    Gemini에 정확히 한 번만 요청합니다.
+    호출 직전에 실제 요청 시도 1회를 기록하며 자동 재시도는 하지 않습니다.
+    """
     global _LAST_SUMMARY_ERROR
     _LAST_SUMMARY_ERROR = None
+
+    if remaining_summary_quota(mode) <= 0:
+        _LAST_SUMMARY_ERROR = "local_quota"
+        return None
 
     api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
@@ -1061,20 +1133,70 @@ def summarize_article(title: str, description: str) -> str | None:
 {clean_description}
 """.strip()
 
+    endpoint = (
+        "https://generativelanguage.googleapis.com/v1beta/models/"
+        f"{urllib.parse.quote(GEMINI_MODEL, safe='')}:generateContent"
+        f"?key={urllib.parse.quote(api_key, safe='')}"
+    )
+
+    # 이 시점부터 실제 Gemini 요청 예산 1회를 사용한다고 간주합니다.
+    record_summary_usage(mode, article_id)
+
     try:
-        client = genai.Client(api_key=api_key)
-        response = client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt,
+        response = requests.post(
+            endpoint,
+            json={
+                "contents": [
+                    {
+                        "parts": [
+                            {"text": prompt},
+                        ]
+                    }
+                ]
+            },
+            timeout=30,
         )
-        text = (response.text or "").strip()
-        return text or None
-    except Exception as exc:
-        error_text = str(exc)
-        if "429" in error_text or "RESOURCE_EXHAUSTED" in error_text:
+
+        if response.status_code == 429:
             _LAST_SUMMARY_ERROR = "quota"
-        else:
-            _LAST_SUMMARY_ERROR = "other"
+            print(
+                "[Gemini summary error] "
+                f"429 RESOURCE_EXHAUSTED: {response.text[:600]}"
+            )
+            return None
+
+        if response.status_code == 503:
+            _LAST_SUMMARY_ERROR = "unavailable"
+            print(
+                "[Gemini summary error] "
+                f"503 UNAVAILABLE: {response.text[:600]}"
+            )
+            return None
+
+        response.raise_for_status()
+        data = response.json()
+        candidates = data.get("candidates") or []
+        parts = (
+            candidates[0]
+            .get("content", {})
+            .get("parts", [])
+            if candidates
+            else []
+        )
+        text = "".join(
+            str(part.get("text") or "")
+            for part in parts
+            if isinstance(part, dict)
+        ).strip()
+
+        if not text:
+            _LAST_SUMMARY_ERROR = "empty"
+            return None
+
+        return text
+
+    except Exception as exc:
+        _LAST_SUMMARY_ERROR = "other"
         print(f"[Gemini summary error] {exc}")
         return None
 
@@ -3355,9 +3477,14 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
             title,
             clean_description,
         ) in summary_queue.items():
+            if remaining_summary_quota("auto") <= 0:
+                break
+
             summary = summarize_article(
                 title=title,
                 description=clean_description,
+                mode="auto",
+                article_id=article_id,
             )
             if summary:
                 update_article_summary(
@@ -3365,6 +3492,9 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
                     summary,
                 )
                 stats["summaries_created"] += 1
+            else:
+                # Gemini 오류 시 같은 실행에서 추가 요청을 보내지 않습니다.
+                break
 
     return stats
 
@@ -3555,17 +3685,21 @@ def summarize_pending_articles(limit: int = 10) -> dict:
         summary = summarize_article(
             title=item["title"],
             description=item["description"],
+            mode="auto",
+            article_id=item["id"],
         )
 
         if summary:
             update_article_summary(item["id"], summary)
-            record_summary_usage("auto", item["id"])
             stats["summarized"] += 1
         else:
             stats["failed"] += 1
             if _LAST_SUMMARY_ERROR == "quota":
                 stats["external_quota_exhausted"] = True
-                break
+
+            # 503/429/기타 오류 모두 이번 collector 실행에서는 즉시 중단.
+            # 다음 30분 실행에서 다시 한 번만 시도합니다.
+            break
 
     return stats
 
@@ -3898,10 +4032,11 @@ def render_article_card(article: dict, category_name: str):
                     summary = summarize_article(
                         article["title"],
                         article["description"],
+                        mode="manual",
+                        article_id=article["id"],
                     )
                     if summary:
                         update_article_summary(article["id"], summary)
-                        record_summary_usage("manual", article["id"])
                         st.rerun()
                     elif _LAST_SUMMARY_ERROR == "quota":
                         st.error(
@@ -3964,10 +4099,11 @@ def render_social_card(article: dict, category_name: str):
                     summary = summarize_article(
                         article["title"],
                         article["description"],
+                        mode="manual",
+                        article_id=article["id"],
                     )
                     if summary:
                         update_article_summary(article["id"], summary)
-                        record_summary_usage("manual", article["id"])
                         st.rerun()
                     elif _LAST_SUMMARY_ERROR == "quota":
                         st.error(
@@ -4031,8 +4167,9 @@ def main():
         quota = get_summary_quota_status()
         st.caption(
             f"현재 DB 저장 기사: {count_articles()}개 · "
-            f"오늘 AI 요약: 자동 {quota['auto_used']}/{quota['auto_limit']} · "
-            f"수동 {quota['manual_used']}/{quota['manual_limit']}"
+            f"오늘 Gemini 요청: 자동 {quota['auto_used']}/{quota['auto_limit']} · "
+            f"수동 {quota['manual_used']}/{quota['manual_limit']} · "
+            f"전체 {quota['total_used']}/{quota['total_limit']} · KST 09:00 리셋"
         )
 
     keyword_map, _ = get_settings()

@@ -18,6 +18,7 @@ jobs:
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       GEMINI_API_KEY: ${{ secrets.GEMINI_API_KEY }}
       GEMINI_MODEL: gemini-3.6-flash
+      GEMINI_DAILY_REQUEST_LIMIT: "20"
       SEARCH_LOOKBACK_HOURS: "48"
       ARTICLE_RETENTION_DAYS: "30"
       AUTO_SUMMARY_DAILY_LIMIT: "10"

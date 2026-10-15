@@ -136,12 +136,16 @@ def main():
         f"{auto_summary['failed']}"
     )
     print(
-        f"Auto quota today        : "
+        f"Auto requests today     : "
         f"{quota['auto_used']}/{quota['auto_limit']}"
     )
     print(
-        f"Manual quota today      : "
+        f"Manual requests today   : "
         f"{quota['manual_used']}/{quota['manual_limit']}"
+    )
+    print(
+        f"Gemini requests today   : "
+        f"{quota['total_used']}/{quota['total_limit']}"
     )
     print(
         "External quota hit      : "

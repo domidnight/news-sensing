@@ -64,7 +64,7 @@ async function summarize(id,btn){
 async function boot(){
   try{
     state.boot=await api("/api/bootstrap");
-    $("#dbStat").textContent=`현재 DB 저장 기사: ${state.boot.totalArticles}개 · 오늘 AI 요약: 자동 ${state.boot.quota.auto_used}/10 · 수동 ${state.boot.quota.manual_used}/10`;
+    $("#dbStat").textContent=`현재 DB 저장 기사: ${state.boot.totalArticles}개 · 오늘 Gemini 요청: 자동 ${state.boot.quota.auto_used}/${state.boot.quota.auto_limit} · 수동 ${state.boot.quota.manual_used}/${state.boot.quota.manual_limit} · 전체 ${state.boot.quota.total_used}/${state.boot.quota.total_limit} · KST 09:00 리셋`;
     if(!state.boot.categories.includes(state.active)) state.active=state.boot.categories[0]||"AI";
     renderTabs();
   }catch(e){

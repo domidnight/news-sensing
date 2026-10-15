@@ -174,27 +174,53 @@ function governmentScopeAllowed(article) {
   return true;
 }
 
-function laDay(value = new Date()) {
-  return new Intl.DateTimeFormat("en-CA", {
-    timeZone: "America/Los_Angeles", year: "numeric", month: "2-digit", day: "2-digit"
-  }).format(value);
+function utcDay(value = new Date()) {
+  return new Date(value).toISOString().slice(0, 10);
 }
 
-async function quotaStatus(sql) {
+function requestLimits(env) {
+  const totalLimit = Math.max(1, Number(env.GEMINI_DAILY_REQUEST_LIMIT || 20));
+  const configuredAuto = Math.max(0, Number(env.AUTO_SUMMARY_DAILY_LIMIT || 10));
+  const configuredManual = Math.max(0, Number(env.MANUAL_SUMMARY_DAILY_LIMIT || 10));
+  const manualLimit = Math.min(configuredManual, totalLimit);
+  const autoLimit = Math.min(
+    configuredAuto,
+    Math.max(0, totalLimit - manualLimit)
+  );
+  return { totalLimit, autoLimit, manualLimit };
+}
+
+async function quotaStatus(sql, env) {
   const rows = await sql.query(
     "SELECT mode, used_at FROM summary_usage WHERE used_at >= NOW() - INTERVAL '2 days'",
     []
   );
-  const today = laDay();
+  const today = utcDay();
   let autoUsed = 0, manualUsed = 0;
+
   for (const row of rows) {
-    const d = laDay(new Date(row.used_at));
-    if (d !== today) continue;
+    if (utcDay(new Date(row.used_at)) !== today) continue;
     if (row.mode === "auto") autoUsed++;
     if (row.mode === "manual") manualUsed++;
   }
-  return { auto_used: autoUsed, auto_limit: 10, manual_used: manualUsed, manual_limit: 10 };
+
+  const { totalLimit, autoLimit, manualLimit } = requestLimits(env);
+  const totalUsed = autoUsed + manualUsed;
+
+  return {
+    auto_used: autoUsed,
+    auto_limit: autoLimit,
+    auto_remaining: Math.max(0, autoLimit - autoUsed),
+    manual_used: manualUsed,
+    manual_limit: manualLimit,
+    manual_remaining: Math.max(0, manualLimit - manualUsed),
+    total_used: totalUsed,
+    total_limit: totalLimit,
+    total_remaining: Math.max(0, totalLimit - totalUsed),
+    reset_at_kst: "09:00",
+  };
 }
+
 
 async function bootstrap(env) {
   const sql = getSql(env);
@@ -203,7 +229,7 @@ async function bootstrap(env) {
     sql.query("SELECT c.name AS category, k.keyword FROM keywords k JOIN categories c ON c.id=k.category_id ORDER BY c.sort_order, k.id", []),
     sql.query("SELECT domain, enabled FROM sources ORDER BY id", []),
     sql.query("SELECT COUNT(*)::int AS count FROM articles", []),
-    quotaStatus(sql),
+    quotaStatus(sql, env),
   ]);
   const keywordMap = Object.fromEntries(NEWS_CATEGORY_NAMES.map(name => [name, []]));
   for (const row of kws) {
@@ -346,15 +372,24 @@ async function settingsSave(request, env) {
 
 async function summarize(request, env) {
   if (!env.GEMINI_API_KEY) return json({ error: "GEMINI_API_KEY is not configured." }, 503);
+
   const body = await readJson(request);
   const articleId = Number(body.articleId);
   if (!Number.isFinite(articleId)) return json({ error: "Bad article id" }, 400);
 
   const sql = getSql(env);
-  const quota = await quotaStatus(sql);
-  if (quota.manual_used >= quota.manual_limit) return json({ error: "오늘 수동 요약 10회를 모두 사용했습니다." }, 429);
+  const quota = await quotaStatus(sql, env);
 
-  const rows = await sql.query("SELECT id,title,description,summary FROM articles WHERE id=$1 LIMIT 1", [articleId]);
+  if (quota.manual_remaining <= 0 || quota.total_remaining <= 0) {
+    return json({
+      error: "오늘 수동 Gemini 요청 한도를 모두 사용했습니다. 한도는 KST 오전 9시에 갱신됩니다."
+    }, 429);
+  }
+
+  const rows = await sql.query(
+    "SELECT id,title,description,summary FROM articles WHERE id=$1 LIMIT 1",
+    [articleId]
+  );
   if (!rows.length) return json({ error: "Article not found" }, 404);
   if (rows[0].summary) return json({ summary: rows[0].summary, quota });
 
@@ -375,41 +410,55 @@ ${String(rows[0].description || "").slice(0, 2500)}`;
   const model = env.GEMINI_MODEL || "gemini-3.6-flash";
   const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(model)}:generateContent?key=${encodeURIComponent(env.GEMINI_API_KEY)}`;
 
-  let resp = null;
-  for (let attempt = 1; attempt <= 3; attempt++) {
-    resp = await fetch(endpoint, {
-      method: "POST",
-      headers: { "content-type": "application/json" },
-      body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
-    });
+  // 실제 Gemini 호출 직전에 수동 요청 1회를 기록합니다.
+  // 성공/503/429 여부와 무관하게 숨은 재시도 없이 정확히 한 번만 호출합니다.
+  await sql.query(
+    "INSERT INTO summary_usage(article_id,mode,used_at) VALUES($1,'manual',NOW())",
+    [articleId]
+  );
 
-    if (resp.ok || resp.status !== 503 || attempt === 3) break;
-
-    // Gemini가 일시적으로 혼잡할 때 잠깐 기다렸다가 자동 재시도합니다.
-    await new Promise(resolve => setTimeout(resolve, attempt * 1200));
-  }
+  const resp = await fetch(endpoint, {
+    method: "POST",
+    headers: { "content-type": "application/json" },
+    body: JSON.stringify({ contents: [{ parts: [{ text: prompt }] }] }),
+  });
 
   if (!resp.ok) {
     if (resp.status === 429) {
-      return json({ error: "Gemini 무료 한도가 소진되었습니다. 다음 한도 갱신 후 다시 시도해 주세요." }, 429);
+      return json({
+        error: "Gemini API 프로젝트의 실제 무료 일일 한도가 소진되었습니다. 한도는 KST 오전 9시에 갱신됩니다."
+      }, 429);
     }
 
     if (resp.status === 503) {
-      return json({ error: "Gemini 서버가 지금 혼잡합니다. 잠시 후 다시 눌러 주세요. 이번 실패는 수동 요약 횟수에 포함되지 않습니다." }, 503);
+      return json({
+        error: "Gemini 서버가 지금 혼잡합니다. 이번 요청 1회는 실제 요청 횟수에 반영했으며 자동 재시도하지 않았습니다. 잠시 후 다시 시도해 주세요."
+      }, 503);
     }
 
     const txt = await resp.text();
-    return json({ error: `요약 서비스 오류(${resp.status}). 잠시 후 다시 시도해 주세요.`, detail: txt.slice(0,120) }, 502);
+    return json({
+      error: `요약 서비스 오류(${resp.status}). 이번 요청은 실제 요청 횟수에 반영되었습니다.`,
+      detail: txt.slice(0, 120)
+    }, 502);
   }
 
   const data = await resp.json();
-  const summary = data?.candidates?.[0]?.content?.parts?.map(x => x.text || "").join("").trim();
-  if (!summary) return json({ error: "요약 결과가 비어 있습니다." }, 502);
+  const summary = data?.candidates?.[0]?.content?.parts
+    ?.map(x => x.text || "")
+    .join("")
+    .trim();
+
+  if (!summary) {
+    return json({
+      error: "요약 결과가 비어 있습니다. 이번 요청은 실제 요청 횟수에 반영되었습니다."
+    }, 502);
+  }
 
   await sql.query("UPDATE articles SET summary=$1 WHERE id=$2", [summary, articleId]);
-  await sql.query("INSERT INTO summary_usage(article_id,mode,used_at) VALUES($1,'manual',NOW())", [articleId]);
-  return json({ summary, quota: await quotaStatus(sql) });
+  return json({ summary, quota: await quotaStatus(sql, env) });
 }
+
 
 async function dispatchCollector(env) {
   if (!env.GITHUB_ACTIONS_TOKEN) throw new Error("GITHUB_ACTIONS_TOKEN secret is not configured.");
