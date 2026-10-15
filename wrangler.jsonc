@@ -12,7 +12,10 @@
     ]
   },
   "vars": {
-    "GEMINI_MODEL": "gemini-3.6-flash"
+    "GEMINI_MODEL": "gemini-3.6-flash",
+    "GEMINI_DAILY_REQUEST_LIMIT": "20",
+    "AUTO_SUMMARY_DAILY_LIMIT": "10",
+    "MANUAL_SUMMARY_DAILY_LIMIT": "10"
   },
   "triggers": {
     "crons": [
