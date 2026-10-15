@@ -5,6 +5,7 @@ Cloudflare Cron이 GitHub Actions를 통해 실행하는 V3 Hybrid 뉴스 + 공�
 from app import (
     ARTICLE_RETENTION_DAYS,
     AUTO_SUMMARY_DAILY_LIMIT,
+    AUTO_SUMMARY_PER_RUN_LIMIT,
     collect_all_categories,
     collect_social_posts,
     get_summary_quota_status,
@@ -25,9 +26,13 @@ def main():
     )
     social_stats = collect_social_posts()
 
-    # 뉴스+소셜 전체 중 가장 최근 미요약 콘텐츠부터 하루 자동 10개
+    # Gemini free-tier의 분당 요청 제한을 피하고 수동 요약 여유를 보호하기 위해
+    # 한 번의 30분 collector 실행에서는 자동 요약을 최대 2건만 요청합니다.
     auto_summary = summarize_pending_articles(
-        limit=AUTO_SUMMARY_DAILY_LIMIT
+        limit=min(
+            AUTO_SUMMARY_PER_RUN_LIMIT,
+            AUTO_SUMMARY_DAILY_LIMIT,
+        )
     )
     quota = get_summary_quota_status()
 
@@ -126,6 +131,9 @@ def main():
     print(
         f"New social posts        : "
         f"{social_stats['new_posts']}"
+    )
+    print(
+        f"Auto summaries/run cap  : {AUTO_SUMMARY_PER_RUN_LIMIT}"
     )
     print(
         f"Auto summaries          : "
