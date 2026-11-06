@@ -3459,8 +3459,24 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
             if not link:
                 continue
 
-            # Google News 중계 링크는 실제 기사 최종 URL까지 따라가
-            # 설정한 언론사 도메인과 일치하는지 먼저 검증합니다.
+            # 같은 카테고리에서 동일 Google News URL은 한 번만 처리
+            if link in seen_links_by_category[
+                category_name
+            ]:
+                continue
+
+            text_to_search = (
+                f"{title} {description_raw}"
+            )
+
+            if not exact_phrase_match(
+                keyword,
+                text_to_search,
+            ):
+                continue
+
+            # 키워드가 실제로 맞는 후보에 한해 Google News 중계 링크를
+            # 최종 기사 URL까지 따라가 언론사 도메인을 검증합니다.
             resolved_link = _resolve_google_news_target(link)
 
             if not _google_entry_matches_requested_source(
@@ -3477,22 +3493,6 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
                 and _host_from_url(resolved_link) != "news.google.com"
             ):
                 link = resolved_link
-
-            # 같은 카테고리에서 동일 URL은 한 번만 처리
-            if link in seen_links_by_category[
-                category_name
-            ]:
-                continue
-
-            text_to_search = (
-                f"{title} {description_raw}"
-            )
-
-            if not exact_phrase_match(
-                keyword,
-                text_to_search,
-            ):
-                continue
 
             seen_links_by_category[
                 category_name
