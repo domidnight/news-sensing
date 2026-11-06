@@ -3004,40 +3004,89 @@ def _feed_source_href(entry) -> str:
         return ""
 
 
+def _requested_domain_list(value: str) -> list[str]:
+    """
+    Google News job은 여러 site: 도메인을 한 번에 묶어 검색하므로
+    'wsj.com,ft.com,...' 형태의 문자열을 개별 도메인으로 복원합니다.
+    """
+    result = []
+    for raw in str(value or "").split(","):
+        domain = normalize_domain(raw).split("/")[0]
+        if domain and domain not in result:
+            result.append(domain)
+    return result
+
+
+def _resolve_google_news_target(link: str) -> str:
+    """
+    Google News RSS 중계 URL을 실제 최종 기사 URL까지 따라갑니다.
+    리다이렉트 확인에 실패하면 원래 링크를 그대로 반환합니다.
+    """
+    if _host_from_url(link) != "news.google.com":
+        return link
+
+    try:
+        response = requests.get(
+            link,
+            timeout=8,
+            allow_redirects=True,
+            headers={
+                "User-Agent": (
+                    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                    "AppleWebKit/537.36 Chrome/124 Safari/537.36"
+                )
+            },
+        )
+        final_url = str(response.url or "").strip()
+        return final_url or link
+    except Exception:
+        return link
+
+
 def _google_entry_matches_requested_source(
     entry,
-    requested_domain: str,
+    requested_domains: str,
+    resolved_link: str = "",
 ) -> bool:
     """
-    Google News가 site:reuters.com 검색 중 Daily Signal 같은
-    다른 매체를 섞어 반환하는 것을 최종 차단합니다.
+    Google News가 site: 검색에 다른 매체/같은 그룹의 별도 매체를
+    섞어 반환하는 것을 최종 차단합니다.
+
+    검증 우선순위:
+    1) Google News 링크의 실제 최종 도메인
+    2) RSS source.href
+    3) source title alias
     """
-    base_domain = normalize_domain(
-        requested_domain
-    ).split("/")[0]
+    domains = _requested_domain_list(requested_domains)
+    if not domains:
+        return False
+
+    resolved_host = _host_from_url(resolved_link)
+    if resolved_host and resolved_host != "news.google.com":
+        return any(
+            _host_matches_domain(resolved_host, domain)
+            for domain in domains
+        )
 
     source_href = _feed_source_href(entry)
-    if source_href:
-        return _host_matches_domain(
-            _host_from_url(source_href),
-            base_domain,
+    source_host = _host_from_url(source_href)
+    if source_host:
+        return any(
+            _host_matches_domain(source_host, domain)
+            for domain in domains
         )
 
-    # source URL이 없을 때는 알려진 9개 매체에 한해 이름 검증
-    aliases = GOOGLE_SOURCE_ALIASES.get(
-        base_domain
-    )
-    if aliases:
-        source_title = _source_key(
-            get_feed_source(entry)
-        )
-        return source_title in {
+    source_title = _source_key(get_feed_source(entry))
+    for domain in domains:
+        aliases = GOOGLE_SOURCE_ALIASES.get(domain)
+        if aliases and source_title in {
             _source_key(alias)
             for alias in aliases
-        }
+        }:
+            return True
 
-    # 기타 사용자가 직접 추가한 사이트는 기존 동작 유지
-    return True
+    # 출처를 검증할 수 없으면 저장하지 않아 잘못된 매체 혼입을 막습니다.
+    return False
 
 
 # =========================================================
@@ -3409,6 +3458,25 @@ def collect_all_categories(generate_summaries: bool = True) -> dict:
 
             if not link:
                 continue
+
+            # Google News 중계 링크는 실제 기사 최종 URL까지 따라가
+            # 설정한 언론사 도메인과 일치하는지 먼저 검증합니다.
+            resolved_link = _resolve_google_news_target(link)
+
+            if not _google_entry_matches_requested_source(
+                entry,
+                result["domain"],
+                resolved_link=resolved_link,
+            ):
+                continue
+
+            # 최종 URL이 확인됐으면 DB에는 Google News 중계 URL 대신
+            # 실제 언론사 원문 URL을 저장합니다.
+            if (
+                _host_from_url(resolved_link)
+                and _host_from_url(resolved_link) != "news.google.com"
+            ):
+                link = resolved_link
 
             # 같은 카테고리에서 동일 URL은 한 번만 처리
             if link in seen_links_by_category[
