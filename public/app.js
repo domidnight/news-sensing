@@ -32,7 +32,7 @@ function renderInfo(){
 function articleHtml(a){
   const social=SOCIAL.includes(state.active);
   const tags=(a.tags||[]).map(t=>`<span class="tag">${social?esc(t):"#"+esc(t).replaceAll(" ","_")}</span>`).join("");
-  const summary=a.summary?`<div class="summary"><b>🤖 3줄 요약</b>\n${esc(a.summary)}</div>`:`<div class="notice">🤖 아직 3줄 요약이 생성되지 않았습니다.</div>`;
+  const summary=a.summary?`<div class="summary summary-slot"><b>🤖 3줄 요약</b>\n${esc(a.summary)}</div>`:`<div class="notice summary-slot">🤖 아직 3줄 요약이 생성되지 않았습니다.</div>`;
   return `<article class="article" data-id="${a.id}">
     <h2>${social?"🗣️":"⭐"} ${esc(a.source||"Unknown")}${social?"":" | "+esc(a.title||"(제목 없음)")}</h2>
     <div class="tags">${tags}</div>
@@ -57,9 +57,39 @@ async function loadArticles(){
   }catch(e){$("#status").innerHTML=`<div class="error">${esc(e.message)}</div>`;}
 }
 async function summarize(id,btn){
-  btn.disabled=true;btn.textContent="요약 중…";
-  try{await api("/api/summary",{method:"POST",headers:{"content-type":"application/json"},body:JSON.stringify({articleId:id})});await boot();await loadArticles();}
-  catch(e){alert(e.message);btn.disabled=false;btn.textContent="🤖 3줄 요약 생성";}
+  const card=btn.closest(`article[data-id="${id}"]`);
+  const slot=card?.querySelector(".summary-slot");
+  const originalText=btn.textContent;
+
+  btn.disabled=true;
+  btn.textContent="요약 중…";
+
+  try{
+    const d=await api("/api/summary",{
+      method:"POST",
+      headers:{"content-type":"application/json"},
+      body:JSON.stringify({articleId:id})
+    });
+
+    // 전체 기사 목록을 다시 불러오지 않고, 누른 카드의 요약 영역만 갱신합니다.
+    if(slot && d.summary){
+      slot.className="summary summary-slot";
+      slot.innerHTML=`<b>🤖 3줄 요약</b>\n${esc(d.summary)}`;
+    }
+
+    // 생성 버튼만 제거하고 원문 링크와 현재 스크롤 위치는 그대로 유지합니다.
+    btn.remove();
+
+    // 상단 Gemini 사용량 숫자만 가볍게 갱신합니다.
+    if(d.quota && state.boot){
+      state.boot.quota=d.quota;
+      $("#dbStat").textContent=`현재 DB 저장 기사: ${state.boot.totalArticles}개 · 오늘 Gemini 요청: 자동 ${d.quota.auto_used}/${d.quota.auto_limit} · 수동 ${d.quota.manual_used}/${d.quota.manual_limit} · 전체 ${d.quota.total_used}/${d.quota.total_limit} · KST 09:00 리셋`;
+    }
+  }catch(e){
+    alert(e.message);
+    btn.disabled=false;
+    btn.textContent=originalText;
+  }
 }
 async function boot(){
   try{
